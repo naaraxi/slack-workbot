@@ -1,0 +1,334 @@
+"""The proactive side of WorkBot.
+
+Two background jobs:
+  - check-in tick (every 60s): DM each eligible user the Yes/No/Almost Done
+    question when their interval is due, during their working hours.
+  - report flush (every WORKBOT_REPORT_FLUSH_SECONDS): post one combined
+    "needs a task" message for everyone who answered No since the last flush.
+
+Silent by default: the tick only ever iterates db.enabled_users(), i.e. users
+who ran /workbot, enabled it, and set working hours. It also skips users who
+are out of office (status emoji), snoozed (Almost Done), outside working
+hours, or paused after ignoring several check-ins in a row.
+"""
+
+import logging
+import os
+import threading
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+from apscheduler.schedulers.background import BackgroundScheduler
+
+from . import db, messages
+
+logger = logging.getLogger("workbot")
+
+# user_ids who answered No and are waiting to be reported, guarded by a lock
+_pending = set()
+_pending_lock = threading.Lock()
+
+PLACEHOLDER_CHANNEL = "C0000000000"
+
+# Consecutive ignored check-ins before the bot pauses a user for the day.
+IGNORE_THRESHOLD = int(os.environ.get("WORKBOT_IGNORE_THRESHOLD", "3"))
+
+# Status emojis that mean "leave me alone" (out of office). Configurable.
+_DEFAULT_SKIP_EMOJIS = ":palm_tree:,:face_with_thermometer:"
+SKIP_EMOJIS = {
+    e.strip()
+    for e in os.environ.get("WORKBOT_SKIP_STATUS_EMOJIS", _DEFAULT_SKIP_EMOJIS).split(",")
+    if e.strip()
+}
+
+
+def add_pending(user_id):
+    with _pending_lock:
+        _pending.add(user_id)
+
+
+def resolve_report_mention(client, handle):
+    """Resolve a user-group handle (e.g. 'projectmanagers') to a Slack subteam
+    mention token '<!subteam^ID>', caching the ID in the DB.
+
+    The ID is re-resolved only when the handle changes, so once resolved it
+    keeps working even if the usergroups:read scope is later removed. Returns
+    "" (no prefix) if the handle is empty or cannot be resolved.
+    """
+    if not handle:
+        return ""
+    handle = handle.lstrip("@").strip()
+
+    cached_handle = db.meta_get("report_group_handle")
+    cached_id = db.meta_get("report_subteam_id")
+    if cached_handle == handle and cached_id:
+        return f"<!subteam^{cached_id}>"
+
+    try:
+        for g in client.usergroups_list().get("usergroups", []):
+            if g.get("handle") == handle:
+                db.meta_set("report_group_handle", handle)
+                db.meta_set("report_subteam_id", g["id"])
+                logger.info("Resolved report group @%s -> %s", handle, g["id"])
+                return f"<!subteam^{g['id']}>"
+        logger.warning("Report group @%s not found via usergroups.list", handle)
+    except Exception:
+        logger.exception(
+            "Could not resolve report group @%s (needs the usergroups:read "
+            "bot scope?)", handle
+        )
+    return ""
+
+
+def is_unavailable(client, user_id):
+    """True if the user's Slack status marks them out of office.
+
+    Fails closed: if the status can't be read, treat the user as unavailable
+    so the bot stays quiet rather than risk pinging someone who is out.
+    """
+    try:
+        profile = client.users_info(user=user_id)["user"]["profile"]
+        return (profile.get("status_emoji") or "") in SKIP_EMOJIS
+    except Exception:
+        logger.exception("Could not read status for %s; treating as unavailable", user_id)
+        return True
+
+
+def _now_utc():
+    return datetime.now(timezone.utc)
+
+
+def within_hours(user):
+    tz = user.get("tz") or "UTC"
+    try:
+        now_local = _now_utc().astimezone(ZoneInfo(tz))
+    except Exception:
+        logger.exception("Bad tz %r for %s; treating as always in-hours", tz, user["user_id"])
+        return True
+    mins = now_local.hour * 60 + now_local.minute
+    return user["work_start_min"] <= mins < user["work_end_min"]
+
+
+def _local_day(user):
+    """Current date in the user's timezone, as 'YYYY-MM-DD'."""
+    tz = user.get("tz") or "UTC"
+    try:
+        zone = ZoneInfo(tz)
+    except Exception:
+        zone = timezone.utc
+    return _now_utc().astimezone(zone).date().isoformat()
+
+
+def _end_of_workday_utc(user):
+    """ISO-8601 UTC of today's work_end in the user's timezone."""
+    tz = user.get("tz") or "UTC"
+    try:
+        zone = ZoneInfo(tz)
+    except Exception:
+        zone = timezone.utc
+    now_local = _now_utc().astimezone(zone)
+    end_local = now_local.replace(
+        hour=user["work_end_min"] // 60,
+        minute=user["work_end_min"] % 60,
+        second=0,
+        microsecond=0,
+    )
+    return end_local.astimezone(timezone.utc).isoformat()
+
+
+def next_checkin_dt(user):
+    """Best estimate of the next check-in time as an aware UTC datetime, used
+    only for display on the Home tab. Returns None if not determinable."""
+    tz = user.get("tz") or "UTC"
+    try:
+        zone = ZoneInfo(tz)
+    except Exception:
+        return None
+    if user.get("work_start_min") is None or user.get("work_end_min") is None:
+        return None
+
+    now_local = _now_utc().astimezone(zone)
+    start = now_local.replace(
+        hour=user["work_start_min"] // 60, minute=user["work_start_min"] % 60,
+        second=0, microsecond=0,
+    )
+    end = now_local.replace(
+        hour=user["work_end_min"] // 60, minute=user["work_end_min"] % 60,
+        second=0, microsecond=0,
+    )
+    if now_local < start:
+        return start.astimezone(timezone.utc)
+    if now_local >= end:
+        return (start + timedelta(days=1)).astimezone(timezone.utc)
+
+    # Within hours: last check-in + interval, clamped to now, rolled to the
+    # next working day if it would fall after work_end.
+    interval = timedelta(minutes=user.get("interval_minutes") or 60)
+    la = user.get("last_asked")
+    base = None
+    if la:
+        try:
+            base = datetime.fromisoformat(la) + interval
+        except ValueError:
+            base = None
+    if base is None or base < _now_utc():
+        base = _now_utc()
+    base_local = base.astimezone(zone)
+    if base_local >= end:
+        return (start + timedelta(days=1)).astimezone(timezone.utc)
+    return base_local.astimezone(timezone.utc)
+
+
+def _snoozed(user):
+    su = user.get("snooze_until")
+    if not su:
+        return False
+    try:
+        return datetime.fromisoformat(su) > _now_utc()
+    except ValueError:
+        return False
+
+
+def _paused(user):
+    pu = user.get("paused_until")
+    if not pu:
+        return False
+    try:
+        return datetime.fromisoformat(pu) > _now_utc()
+    except ValueError:
+        return False
+
+
+def _due(user):
+    la = user.get("last_asked")
+    if not la:
+        return True
+    try:
+        last = datetime.fromisoformat(la)
+    except ValueError:
+        return True
+    return _now_utc() - last >= timedelta(minutes=user["interval_minutes"])
+
+
+def _dm(client, user_id, text, blocks=None):
+    channel = client.conversations_open(users=user_id)["channel"]["id"]
+    client.chat_postMessage(channel=channel, text=text, blocks=blocks)
+
+
+def supersede(client, user):
+    """Edit an outstanding check-in to an 'expired' note, dropping its buttons."""
+    ch = user.get("last_msg_channel")
+    ts = user.get("last_msg_ts")
+    if not (ch and ts and user.get("awaiting_reply")):
+        return
+    lang = user.get("lang")
+    try:
+        client.chat_update(
+            channel=ch,
+            ts=ts,
+            text=messages.expired(lang),
+            blocks=messages.confirm_blocks(messages.expired(lang)),
+        )
+    except Exception:
+        logger.exception("Failed to supersede check-in for %s", user.get("user_id"))
+
+
+def send_checkin(client, user):
+    """DM the check-in question to one user and record it as outstanding."""
+    lang = user.get("lang")
+    channel = client.conversations_open(users=user["user_id"])["channel"]["id"]
+    resp = client.chat_postMessage(
+        channel=channel,
+        blocks=messages.checkin_blocks(lang),
+        text=messages.checkin_fallback(lang),
+    )
+    db.record_sent(user["user_id"], channel, resp["ts"])
+
+
+def _process_user(client, user):
+    uid = user["user_id"]
+
+    # Daily reset at local midnight: clear yesterday's per-day state so a "No"
+    # (or ignores, pause, snooze) never carries into the new morning.
+    today = _local_day(user)
+    if user.get("last_reset_day") != today:
+        if user.get("awaiting_reply"):
+            supersede(client, user)
+        db.daily_reset(uid, today)
+        user = db.get_user(uid)
+
+    # Lift an expired pause before anything else.
+    if user.get("paused_until"):
+        if _paused(user):
+            return
+        db.resume(uid)
+        user = db.get_user(uid)
+
+    if _snoozed(user) or not within_hours(user) or not _due(user):
+        return
+    if is_unavailable(client, uid):
+        return
+
+    if user.get("awaiting_reply"):
+        # The previous check-in was never answered: count it as ignored.
+        count = (user.get("consecutive_ignored") or 0) + 1
+        supersede(client, user)
+        if count >= IGNORE_THRESHOLD:
+            db.set_paused(uid, _end_of_workday_utc(user))
+            lang = user.get("lang")
+            _dm(client, uid, messages.paused(lang), messages.paused_blocks(lang))
+            return
+        db.bump_ignored(uid, count)
+
+    send_checkin(client, user)
+
+
+def _tick(client):
+    for user in db.enabled_users():
+        try:
+            _process_user(client, user)
+        except Exception:
+            logger.exception("check-in failed for %s", user.get("user_id"))
+
+
+def _flush_reports(client, report_channel, report_mention=""):
+    with _pending_lock:
+        if not _pending:
+            return
+        ids = list(_pending)
+        _pending.clear()
+
+    # Drop anyone who went out of office between answering and this flush.
+    ids = [u for u in ids if not is_unavailable(client, u)]
+    if not ids:
+        return
+
+    text = messages.needs_task_text(ids, mention=report_mention)
+    if not report_channel or report_channel == PLACEHOLDER_CHANNEL:
+        logger.warning("No report channel configured; would have posted: %s", text)
+        return
+    try:
+        client.chat_postMessage(channel=report_channel, text=text)
+    except Exception:
+        logger.exception("Failed to post report; re-queuing %s", ids)
+        with _pending_lock:
+            _pending.update(ids)
+
+
+def start(client, report_channel, flush_seconds=60, report_mention=""):
+    sched = BackgroundScheduler(timezone="UTC")
+    sched.add_job(lambda: _tick(client), "interval", seconds=60, id="checkin")
+    sched.add_job(
+        lambda: _flush_reports(client, report_channel, report_mention),
+        "interval",
+        seconds=flush_seconds,
+        id="flush",
+    )
+    sched.start()
+    logger.info(
+        "Scheduler started (check-in 60s, report flush %ss, ignore threshold %s, channel=%s)",
+        flush_seconds,
+        IGNORE_THRESHOLD,
+        report_channel or "unset",
+    )
+    return sched
