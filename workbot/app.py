@@ -31,6 +31,7 @@ def main():
     db.init_db()
     logger.info("Database ready at %s", db.DB_PATH)
     messages.write_templates()
+    scheduler.ensure_in_channel(app.client, REPORT_CHANNEL)
     report_mention = scheduler.resolve_report_mention(app.client, REPORT_GROUP)
     scheduler.start(
         app.client,

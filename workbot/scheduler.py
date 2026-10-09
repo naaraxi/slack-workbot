@@ -14,6 +14,7 @@ hours, or paused after ignoring several check-ins in a row.
 
 import logging
 import os
+import re
 import threading
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -92,6 +93,63 @@ def is_unavailable(client, user_id):
     except Exception:
         logger.exception("Could not read status for %s; treating as unavailable", user_id)
         return True
+
+
+def _resolve_channel_id(client, value):
+    """A channel ID as-is, or resolve a public-channel #name to its ID."""
+    v = value.strip()
+    if re.fullmatch(r"[CG][A-Z0-9]{6,}", v):
+        return v
+    name = v.lstrip("#")
+    try:
+        cursor = None
+        while True:
+            resp = client.conversations_list(
+                types="public_channel", limit=1000, cursor=cursor, exclude_archived=True
+            )
+            for ch in resp.get("channels", []):
+                if ch.get("name") == name:
+                    return ch["id"]
+            cursor = resp.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+        logger.warning("Report channel '%s' not found to join", value)
+    except Exception:
+        logger.exception("Could not resolve channel '%s' to join (channels:read?)", value)
+    return None
+
+
+def ensure_in_channel(client, report_channel):
+    """Join the report channel at startup (public channels only; idempotent).
+
+    Posts the one-time intro message only when the bot *actually* joins a
+    channel it has never introduced itself to (tracked in the DB), so a restart
+    (already a member) or a leave-and-rejoin never reposts it.
+    """
+    if not report_channel or report_channel == PLACEHOLDER_CHANNEL:
+        return
+    cid = _resolve_channel_id(client, report_channel)
+    if not cid:
+        return
+    try:
+        resp = client.conversations_join(channel=cid)
+    except Exception:
+        logger.exception("Could not join report channel %s (channels:join?)", cid)
+        return
+
+    warnings = (resp.get("response_metadata") or {}).get("warnings") or []
+    newly_joined = resp.get("warning") != "already_in_channel" and "already_in_channel" not in warnings
+    if not newly_joined:
+        return  # restart / already a member
+    if db.meta_get(f"intro:{cid}"):
+        return  # introduced here before; never repeat
+
+    try:
+        client.chat_postMessage(channel=cid, text=messages.join_message())
+        db.meta_set(f"intro:{cid}", _now_utc().isoformat())
+        logger.info("Joined %s and posted intro", cid)
+    except Exception:
+        logger.exception("Could not post join message to %s", cid)
 
 
 def _now_utc():

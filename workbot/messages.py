@@ -118,6 +118,12 @@ DEFAULTS = {
     "needs_task_one": "{mentions} needs a task!",
     "needs_task_many": "{mentions} need a task!",
     "report_prefix": "{mention} ✋ ",
+    # Posted once, when the bot newly joins the report channel.
+    "join_message": (
+        ":wave: Hi, I'm *WorkBot*. I check in privately with people about whether "
+        "they have a task, and post here when someone is free to pick one up. "
+        ":raised_hand: It's opt-in: run `/workbot` to join in."
+    ),
 }
 
 # Check-in interval choices offered in the Settings modal (minutes).
@@ -273,6 +279,10 @@ def settings_saved(user):
         tz=user.get("tz") or "unknown",
         interval=interval_label(user.get("interval_minutes") or 60),
     )
+
+
+def join_message(lang=None):
+    return t("join_message", lang)
 
 
 def needs_task_text(user_ids, lang=None, mention=""):
