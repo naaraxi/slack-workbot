@@ -61,7 +61,8 @@ def _update_message(client, body, text, blocks=None):
 def _home_status(client, user):
     """Live status for the Home tab: away / paused / snoozed / in-hours + the
     next expected check-in time."""
-    st = {"away": False, "paused_until": None, "snooze_until": None, "next_ts": None, "in_hours": False}
+    st = {"away": False, "paused_until": None, "snooze_until": None, "next_ts": None,
+          "in_hours": False, "active_users": db.active_count()}
     if not user.get("enabled") or not user.get("configured"):
         return st
     st["in_hours"] = scheduler.within_hours(user)

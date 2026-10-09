@@ -34,6 +34,9 @@ PLACEHOLDER_CHANNEL = "C0000000000"
 # Consecutive ignored check-ins before the bot pauses a user for the day.
 IGNORE_THRESHOLD = int(os.environ.get("WORKBOT_IGNORE_THRESHOLD", "3"))
 
+# Delete the bot's own DM messages older than this many hours (0 = never).
+PRUNE_AFTER_HOURS = int(os.environ.get("WORKBOT_PRUNE_AFTER_HOURS", "24"))
+
 # Status emojis that mean "leave me alone" (out of office). Configurable.
 _DEFAULT_SKIP_EMOJIS = ":palm_tree:,:face_with_thermometer:"
 SKIP_EMOJIS = {
@@ -373,6 +376,47 @@ def _flush_reports(client, report_channel, report_mention=""):
             _pending.update(ids)
 
 
+def _prune_dms(client):
+    """Delete the bot's own DM messages older than PRUNE_AFTER_HOURS, for every
+    enabled user. Only messages WorkBot posted (bot_id present) are removed, and
+    only in direct messages; the user's own messages are left untouched."""
+    if PRUNE_AFTER_HOURS <= 0:
+        return
+    cutoff = (_now_utc() - timedelta(hours=PRUNE_AFTER_HOURS)).timestamp()
+    latest = f"{cutoff:.6f}"
+    for user in db.enabled_users():
+        uid = user["user_id"]
+        try:
+            channel = client.conversations_open(users=uid)["channel"]["id"]
+        except Exception:
+            logger.exception("prune: could not open DM for %s", uid)
+            continue
+        deleted = 0
+        cursor = None
+        try:
+            while True:
+                resp = client.conversations_history(
+                    channel=channel, latest=latest, limit=200, cursor=cursor
+                )
+                for msg in resp.get("messages", []):
+                    if not msg.get("bot_id"):
+                        continue  # leave the user's own messages
+                    try:
+                        client.chat_delete(channel=channel, ts=msg["ts"])
+                        deleted += 1
+                    except Exception:
+                        pass  # already gone / not deletable
+                if not resp.get("has_more"):
+                    break
+                cursor = (resp.get("response_metadata") or {}).get("next_cursor")
+                if not cursor:
+                    break
+            if deleted:
+                logger.info("Pruned %d old DM message(s) for %s", deleted, uid)
+        except Exception:
+            logger.exception("prune failed for %s", uid)
+
+
 def start(client, report_channel, flush_seconds=60, report_mention=""):
     sched = BackgroundScheduler(timezone="UTC")
     sched.add_job(lambda: _tick(client), "interval", seconds=60, id="checkin")
@@ -382,11 +426,15 @@ def start(client, report_channel, flush_seconds=60, report_mention=""):
         seconds=flush_seconds,
         id="flush",
     )
+    if PRUNE_AFTER_HOURS > 0:
+        sched.add_job(lambda: _prune_dms(client), "interval", seconds=3600, id="prune")
     sched.start()
     logger.info(
-        "Scheduler started (check-in 60s, report flush %ss, ignore threshold %s, channel=%s)",
+        "Scheduler started (check-in 60s, report flush %ss, ignore threshold %s, "
+        "prune DMs after %sh, channel=%s)",
         flush_seconds,
         IGNORE_THRESHOLD,
+        PRUNE_AFTER_HOURS or "off",
         report_channel or "unset",
     )
     return sched

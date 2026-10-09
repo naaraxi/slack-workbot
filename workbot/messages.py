@@ -105,6 +105,7 @@ DEFAULTS = {
     "home_snoozed": "Snoozed until {time}. Tap *Check me in now* if you finish sooner.",
     "home_offhours": "Outside your working hours. Next check-in {time}.",
     "home_next": "Next check-in {time} ({rel}).",
+    "home_active_users": "Total users: {n}",
     # Settings modal
     "btn_settings": "Settings",
     "interval_field_label": "Check in every",
@@ -392,16 +393,26 @@ def _home_state_line(user, st, lang):
     return ""
 
 
+def _active_users_block(st, lang):
+    n = st.get("active_users")
+    if n is None:
+        return None
+    return {"type": "context", "elements": [{"type": "mrkdwn", "text": t("home_active_users", lang).format(n=n)}]}
+
+
 def home_view(user, st=None):
-    """The persistent App Home tab: a status summary, a live state line, and
-    the action buttons. `st` is a status dict from the handler (away / paused /
-    snoozed / in_hours / next_ts)."""
+    """The persistent App Home tab: a status summary, a live state line, the
+    active-user count, and the action buttons. `st` is a status dict from the
+    handler (away / paused / snoozed / in_hours / next_ts / active_users)."""
     st = st or {}
     lang = user.get("lang")
     blocks = [{"type": "header", "text": {"type": "plain_text", "text": "WorkBot"}}]
 
     if not user["enabled"]:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": t("home_blurb", lang)}})
+        ab = _active_users_block(st, lang)
+        if ab:
+            blocks.append(ab)
         blocks.append({"type": "actions", "elements": [
             _btn(t("btn_enable", lang), "wb_enable", "primary"),
             _btn(t("btn_settings", lang), "wb_settings"),
@@ -414,6 +425,10 @@ def home_view(user, st=None):
     state_line = _home_state_line(user, st, lang)
     if state_line:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": state_line}]})
+
+    ab = _active_users_block(st, lang)
+    if ab:
+        blocks.append(ab)
 
     elements = [
         _btn(t("btn_disable", lang), "wb_disable"),

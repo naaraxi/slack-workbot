@@ -250,3 +250,11 @@ def enabled_users():
             "SELECT * FROM users WHERE enabled = 1 AND configured = 1"
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def active_count():
+    """How many users currently have WorkBot enabled."""
+    with _conn() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS c FROM users WHERE enabled = 1"
+        ).fetchone()["c"]
