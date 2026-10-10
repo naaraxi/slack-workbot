@@ -205,14 +205,18 @@ def register(app):
         end = values["end_block"]["end"]["selected_time"]
         interval = values["interval_block"]["interval"]["selected_option"]["value"]
         lang = values["lang_block"]["lang"]["selected_option"]["value"]
+        day_opts = values["days_block"]["days"].get("selected_options") or []
+        days = sorted(o["value"] for o in day_opts)
         start_min = hhmm_to_minutes(start)
         end_min = hhmm_to_minutes(end)
 
+        errors = {}
         if end_min <= start_min:
-            ack(
-                response_action="errors",
-                errors={"end_block": messages.err_end_before_start(lang)},
-            )
+            errors["end_block"] = messages.err_end_before_start(lang)
+        if not days:
+            errors["days_block"] = messages.err_no_days(lang)
+        if errors:
+            ack(response_action="errors", errors=errors)
             return
 
         ack()
@@ -222,6 +226,7 @@ def register(app):
         db.set_working_hours(user_id, tz, start_min, end_min)
         db.set_interval(user_id, int(interval))
         db.set_lang(user_id, lang)
+        db.set_work_days(user_id, ",".join(days))
         if first_setup:
             db.set_enabled(user_id, True)
 

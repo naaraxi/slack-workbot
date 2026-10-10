@@ -66,6 +66,7 @@ DEFAULTS = {
     "modal_start_label": "Start of working day",
     "modal_end_label": "End of working day",
     "err_end_before_start": "End time must be after start time.",
+    "err_no_days": "Pick at least one working day.",
     # Check-in DM + answers
     "checkin": "Do you have a Jira task you're working on right now?",
     "checkin_fallback": "WorkBot check-in: do you have a task?",
@@ -110,6 +111,7 @@ DEFAULTS = {
     "btn_settings": "Settings",
     "interval_field_label": "Check in every",
     "lang_field_label": "Language",
+    "days_field_label": "Working days",
     "settings_saved": (
         "Settings saved. Working hours: *{hours}* ({tz}), checking in every "
         "*{interval}*."
@@ -132,6 +134,17 @@ INTERVAL_CHOICES = ["30", "60", "120", "180", "240"]
 
 # Display names for the language dropdown (shown in the language itself).
 LANG_NAMES = {"en": "English", "sv": "Svenska"}
+
+# Working-day checkboxes: (label, ISO weekday). Edit labels here to translate.
+DAY_CHOICES = [
+    ("Monday", "1"),
+    ("Tuesday", "2"),
+    ("Wednesday", "3"),
+    ("Thursday", "4"),
+    ("Friday", "5"),
+    ("Saturday", "6"),
+    ("Sunday", "7"),
+]
 
 # Duration choices for the Almost Done modal: (label, minutes). Edit here.
 ALMOST_CHOICES = [
@@ -251,6 +264,10 @@ def err_end_before_start(lang=None):
     return t("err_end_before_start", lang)
 
 
+def err_no_days(lang=None):
+    return t("err_no_days", lang)
+
+
 def expired(lang=None):
     return t("expired", lang)
 
@@ -358,6 +375,11 @@ def _date_token(ts):
     return f"<!date^{int(ts)}^{{time}}|soon>"
 
 
+def _date_token_full(ts):
+    """Like _date_token but includes the day (for check-ins not today)."""
+    return f"<!date^{int(ts)}^{{date_short_pretty}} {{time}}|soon>"
+
+
 def _rel_time(ts):
     mins = int((ts - time.time()) // 60)
     if mins <= 0:
@@ -386,7 +408,7 @@ def _home_state_line(user, st, lang):
         return t("home_snoozed", lang).format(time=_date_token(ep) if ep else "later")
     if not st.get("in_hours"):
         ep = st.get("next_ts")
-        return t("home_offhours", lang).format(time=_date_token(ep) if ep else "later")
+        return t("home_offhours", lang).format(time=_date_token_full(ep) if ep else "later")
     ep = st.get("next_ts")
     if ep:
         return t("home_next", lang).format(time=_date_token(ep), rel=_rel_time(ep))
@@ -479,6 +501,21 @@ def _select_option(label, value):
     return {"text": {"type": "plain_text", "text": label}, "value": value}
 
 
+def _days_input(user, lang):
+    cur = {d for d in (user.get("work_days") or "1,2,3,4,5").split(",") if d.strip()}
+    opts = [_select_option(label, value) for label, value in DAY_CHOICES]
+    element = {"type": "checkboxes", "action_id": "days", "options": opts}
+    initial = [o for o in opts if o["value"] in cur]
+    if initial:
+        element["initial_options"] = initial
+    return {
+        "type": "input",
+        "block_id": "days_block",
+        "label": {"type": "plain_text", "text": t("days_field_label", lang)},
+        "element": element,
+    }
+
+
 def settings_modal(user, private_metadata="", lang=None):
     """Working hours + check-in interval + language, pre-filled from the user."""
     lang = lang or user.get("lang") or DEFAULT_LANG
@@ -517,6 +554,7 @@ def settings_modal(user, private_metadata="", lang=None):
                 "label": {"type": "plain_text", "text": t("modal_end_label", lang)},
                 "element": {"type": "timepicker", "action_id": "end", "initial_time": end_time},
             },
+            _days_input(user, lang),
             {
                 "type": "input",
                 "block_id": "interval_block",

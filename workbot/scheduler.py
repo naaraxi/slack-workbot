@@ -159,6 +159,13 @@ def _now_utc():
     return datetime.now(timezone.utc)
 
 
+def work_days(user):
+    """Set of ISO weekdays (Mon=1..Sun=7) the user wants check-ins; default Mon-Fri."""
+    raw = user.get("work_days") or "1,2,3,4,5"
+    days = {int(x) for x in str(raw).split(",") if x.strip().isdigit()}
+    return days or {1, 2, 3, 4, 5}
+
+
 def within_hours(user):
     tz = user.get("tz") or "UTC"
     try:
@@ -166,6 +173,8 @@ def within_hours(user):
     except Exception:
         logger.exception("Bad tz %r for %s; treating as always in-hours", tz, user["user_id"])
         return True
+    if now_local.isoweekday() not in work_days(user):
+        return False  # not a working day for this user
     mins = now_local.hour * 60 + now_local.minute
     return user["work_start_min"] <= mins < user["work_end_min"]
 
@@ -197,6 +206,20 @@ def _end_of_workday_utc(user):
     return end_local.astimezone(timezone.utc).isoformat()
 
 
+def _next_working_start(now_local, user, zone):
+    """Start-of-work on the next working day after today, as aware UTC."""
+    days = work_days(user)
+    for i in range(1, 8):
+        d = now_local + timedelta(days=i)
+        if d.isoweekday() in days:
+            s = d.replace(
+                hour=user["work_start_min"] // 60, minute=user["work_start_min"] % 60,
+                second=0, microsecond=0,
+            )
+            return s.astimezone(timezone.utc)
+    return None
+
+
 def next_checkin_dt(user):
     """Best estimate of the next check-in time as an aware UTC datetime, used
     only for display on the Home tab. Returns None if not determinable."""
@@ -208,6 +231,7 @@ def next_checkin_dt(user):
     if user.get("work_start_min") is None or user.get("work_end_min") is None:
         return None
 
+    days = work_days(user)
     now_local = _now_utc().astimezone(zone)
     start = now_local.replace(
         hour=user["work_start_min"] // 60, minute=user["work_start_min"] % 60,
@@ -217,27 +241,29 @@ def next_checkin_dt(user):
         hour=user["work_end_min"] // 60, minute=user["work_end_min"] % 60,
         second=0, microsecond=0,
     )
-    if now_local < start:
-        return start.astimezone(timezone.utc)
-    if now_local >= end:
-        return (start + timedelta(days=1)).astimezone(timezone.utc)
+    today_working = now_local.isoweekday() in days
 
-    # Within hours: last check-in + interval, clamped to now, rolled to the
-    # next working day if it would fall after work_end.
-    interval = timedelta(minutes=user.get("interval_minutes") or 60)
-    la = user.get("last_asked")
-    base = None
-    if la:
-        try:
-            base = datetime.fromisoformat(la) + interval
-        except ValueError:
-            base = None
-    if base is None or base < _now_utc():
-        base = _now_utc()
-    base_local = base.astimezone(zone)
-    if base_local >= end:
-        return (start + timedelta(days=1)).astimezone(timezone.utc)
-    return base_local.astimezone(timezone.utc)
+    if today_working and now_local < start:
+        return start.astimezone(timezone.utc)
+
+    if today_working and now_local < end:
+        # Within hours: last check-in + interval, clamped to now.
+        interval = timedelta(minutes=user.get("interval_minutes") or 60)
+        la = user.get("last_asked")
+        base = None
+        if la:
+            try:
+                base = datetime.fromisoformat(la) + interval
+            except ValueError:
+                base = None
+        if base is None or base < _now_utc():
+            base = _now_utc()
+        base_local = base.astimezone(zone)
+        if base_local < end:
+            return base_local.astimezone(timezone.utc)
+
+    # After hours, or not a working day: next working day's start.
+    return _next_working_start(now_local, user, zone)
 
 
 def _snoozed(user):

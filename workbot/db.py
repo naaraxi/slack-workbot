@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS users (
     tz                  TEXT,                         -- e.g. Europe/Stockholm
     work_start_min      INTEGER,                      -- minutes from local midnight
     work_end_min        INTEGER,
+    work_days           TEXT DEFAULT '1,2,3,4,5',     -- ISO weekdays (Mon=1..Sun=7)
     interval_minutes    INTEGER NOT NULL DEFAULT 60,
     snooze_until        TEXT,                         -- ISO-8601 UTC, nullable
     last_asked          TEXT,                         -- ISO-8601 UTC, nullable
@@ -52,6 +53,7 @@ _MIGRATIONS = {
     "last_reset_day": "TEXT",
     "lang": "TEXT",
     "last_free": "TEXT",
+    "work_days": "TEXT DEFAULT '1,2,3,4,5'",
 }
 
 
@@ -159,6 +161,10 @@ def set_interval(user_id, minutes):
 
 def set_lang(user_id, lang):
     _update(user_id, lang=lang)
+
+
+def set_work_days(user_id, days_csv):
+    _update(user_id, work_days=days_csv)
 
 
 def set_last_free(user_id, when_iso):
