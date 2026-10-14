@@ -62,7 +62,8 @@ def _home_status(client, user):
     """Live status for the Home tab: away / paused / snoozed / in-hours + the
     next expected check-in time."""
     st = {"away": False, "paused_until": None, "snooze_until": None, "next_ts": None,
-          "in_hours": False, "active_users": db.active_count()}
+          "in_hours": False, "active_users": db.active_count(),
+          "stats": db.event_counts(user["user_id"])}
     if not user.get("enabled") or not user.get("configured"):
         return st
     st["in_hours"] = scheduler.within_hours(user)
@@ -246,6 +247,7 @@ def register(app):
         user_id = body["user"]["id"]
         user = db.get_user(user_id) or {}
         db.record_answer(user_id, "yes")
+        db.record_event(user_id, "yes")  # log for stats / export
         text = messages.answer_yes(user)
         _update_message(client, body, text, messages.confirm_free_blocks(text, user.get("lang")))
 
@@ -255,6 +257,7 @@ def register(app):
         user_id = body["user"]["id"]
         user = db.get_user(user_id) or {}
         db.record_answer(user_id, "no")
+        db.record_event(user_id, "no")  # log for stats / export
         scheduler.add_pending(user_id)
         _update_message(client, body, messages.answer_no(user.get("lang")))
 
@@ -278,6 +281,7 @@ def register(app):
             view["state"]["values"]["dur_block"]["dur"]["selected_option"]["value"]
         )
         db.record_answer(user_id, "almost")
+        db.record_event(user_id, "almost", detail=str(minutes))  # log + keep the minutes
         db.set_snooze(user_id, (_now_utc() + timedelta(minutes=minutes)).isoformat())
 
         text = messages.answer_almost(messages.almost_label(minutes), user.get("lang"))

@@ -341,6 +341,7 @@ def _process_user(client, user):
     if user.get("last_reset_day") != today:
         if user.get("awaiting_reply"):
             supersede(client, user)
+            db.record_event(uid, "ignored")  # last check-in of the day went unanswered
         db.daily_reset(uid, today)
         user = db.get_user(uid)
 
@@ -360,6 +361,7 @@ def _process_user(client, user):
         # The previous check-in was never answered: count it as ignored.
         count = (user.get("consecutive_ignored") or 0) + 1
         supersede(client, user)
+        db.record_event(uid, "ignored")  # log for stats / export
         if count >= IGNORE_THRESHOLD:
             db.set_paused(uid, _end_of_workday_utc(user))
             lang = user.get("lang")

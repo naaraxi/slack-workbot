@@ -79,12 +79,26 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
+# One row per check-in outcome, kept forever as the history to graph from.
+EVENTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS events (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    event   TEXT NOT NULL,   -- 'yes' / 'no' / 'almost' / 'ignored'
+    detail  TEXT,            -- e.g. the Almost Done minutes; else NULL
+    ts      TEXT NOT NULL    -- ISO-8601 UTC
+);
+CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
+"""
+
 
 def init_db():
     with _conn() as conn:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.executescript(SCHEMA)
         conn.executescript(META_SCHEMA)
+        conn.executescript(EVENTS_SCHEMA)
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
         for col, decl in _MIGRATIONS.items():
             if col not in existing:
@@ -264,3 +278,25 @@ def active_count():
         return conn.execute(
             "SELECT COUNT(*) AS c FROM users WHERE enabled = 1"
         ).fetchone()["c"]
+
+
+def record_event(user_id, event, detail=None):
+    """Append one check-in outcome to the history log."""
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO events (user_id, event, detail, ts) VALUES (?, ?, ?, ?)",
+            (user_id, event, detail, utcnow_iso()),
+        )
+
+
+def event_counts(user_id):
+    """All-time per-outcome counts for one user, zero-filled."""
+    counts = {"yes": 0, "no": 0, "almost": 0, "ignored": 0}
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT event, COUNT(*) AS c FROM events WHERE user_id = ? GROUP BY event",
+            (user_id,),
+        ).fetchall()
+    for r in rows:
+        counts[r["event"]] = r["c"]
+    return counts

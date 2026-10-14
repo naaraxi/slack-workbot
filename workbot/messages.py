@@ -107,6 +107,7 @@ DEFAULTS = {
     "home_offhours": "Outside your working hours. Next check-in {time}.",
     "home_next": "Next check-in {time} ({rel}).",
     "home_active_users": "Total users: {n}",
+    "home_stats": "Your check-ins so far: {yes} Yes, {no} No, {almost} Almost Done, {ignored} ignored",
     # Settings modal
     "btn_settings": "Settings",
     "interval_field_label": "Check in every",
@@ -422,6 +423,15 @@ def _active_users_block(st, lang):
     return {"type": "context", "elements": [{"type": "mrkdwn", "text": t("home_active_users", lang).format(n=n)}]}
 
 
+def _stats_block(st, lang):
+    # Personal tally, shown only once the user has any history.
+    s = st.get("stats")
+    if not s or sum(s.values()) == 0:
+        return None
+    text = t("home_stats", lang).format(yes=s["yes"], no=s["no"], almost=s["almost"], ignored=s["ignored"])
+    return {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
+
+
 def home_view(user, st=None):
     """The persistent App Home tab: a status summary, a live state line, the
     active-user count, and the action buttons. `st` is a status dict from the
@@ -432,9 +442,9 @@ def home_view(user, st=None):
 
     if not user["enabled"]:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": t("home_blurb", lang)}})
-        ab = _active_users_block(st, lang)
-        if ab:
-            blocks.append(ab)
+        for blk in (_active_users_block(st, lang), _stats_block(st, lang)):
+            if blk:
+                blocks.append(blk)
         blocks.append({"type": "actions", "elements": [
             _btn(t("btn_enable", lang), "wb_enable", "primary"),
             _btn(t("btn_settings", lang), "wb_settings"),
@@ -448,9 +458,9 @@ def home_view(user, st=None):
     if state_line:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": state_line}]})
 
-    ab = _active_users_block(st, lang)
-    if ab:
-        blocks.append(ab)
+    for blk in (_active_users_block(st, lang), _stats_block(st, lang)):
+        if blk:
+            blocks.append(blk)
 
     elements = [
         _btn(t("btn_disable", lang), "wb_disable"),
