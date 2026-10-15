@@ -483,6 +483,7 @@ def start(client, report_channel, report_mention=""):
 
     refresh_jira_projects()  # populate the dropdown cache before anyone opens Settings
     suggest.refresh_candidates()  # populate the suggestion pool at startup
+    suggest.refresh_usage()  # populate the Codex usage snapshot at startup
 
     sched = BackgroundScheduler(timezone="UTC")
     sched.add_job(lambda: _tick(client), "interval", seconds=60, id="checkin")
@@ -492,6 +493,9 @@ def start(client, report_channel, report_mention=""):
         # Refresh the project list daily, and the unassigned-task pool hourly.
         sched.add_job(refresh_jira_projects, "interval", seconds=86400, id="jira_projects")
         sched.add_job(suggest.refresh_candidates, "interval", seconds=3600, id="jira_candidates")
+    if suggest.enabled():
+        # Refresh the Codex usage/rate-limit snapshot hourly (a tiny separate query).
+        sched.add_job(suggest.refresh_usage, "interval", seconds=3600, id="codex_usage")
     sched.start()
     logger.info(
         "Scheduler started (check-in 60s, ignore threshold %s, prune DMs after %sh, channel=%s)",

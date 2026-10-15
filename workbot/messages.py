@@ -110,6 +110,9 @@ DEFAULTS = {
     "home_next": "Next check-in {time} ({rel}).",
     "home_active_users": "Total users: {n}",
     "home_stats": "Your check-ins so far: {yes} Yes, {no} No, {almost} Almost Done, {ignored} ignored",
+    "home_codex_tokens": "Codex tokens this cycle: {tokens}",
+    "home_codex_usage": "Codex usage: {percent} of the {window} limit, resets {reset}",
+    "home_codex_usage_secondary": " (plus {percent} of the {window} limit)",
     # Settings modal
     "btn_settings": "Settings",
     "interval_field_label": "Check in every",
@@ -462,6 +465,47 @@ def _stats_block(st, lang):
     return {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
 
 
+def _window_label(minutes):
+    """Human label for a rate-limit window length in minutes."""
+    if not minutes:
+        return "current"
+    if minutes == 10080:
+        return "weekly"
+    if minutes == 1440:
+        return "daily"
+    if minutes % 60 == 0:
+        return f"{minutes // 60}-hour"
+    return f"{minutes}-minute"
+
+
+def _codex_block(st, lang):
+    # WorkBot's own Codex token use this cycle, plus the account rate-limit usage
+    # (from `/status`). Hidden until there's something to show.
+    c = st.get("codex")
+    if not c:
+        return None
+    lines = []
+    # Always show the token line once Codex is active (0 before the first call
+    # this cycle), so the metric doesn't vanish between cycles.
+    tokens = c.get("tokens") or 0
+    lines.append(t("home_codex_tokens", lang).format(tokens=f"{tokens:,}"))
+    percent = c.get("percent")
+    if percent is not None:
+        reset = _date_token_full(c["resets_at"]) if c.get("resets_at") else "soon"
+        line = t("home_codex_usage", lang).format(
+            percent=f"{percent:.1f}%", window=_window_label(c.get("window_minutes")), reset=reset,
+        )
+        sec = c.get("secondary") or {}
+        if sec.get("percent") is not None:
+            line += t("home_codex_usage_secondary", lang).format(
+                percent=f"{sec['percent']:.1f}%", window=_window_label(sec.get("window_minutes")),
+            )
+        lines.append(line)
+    if not lines:
+        return None
+    return {"type": "context", "elements": [{"type": "mrkdwn", "text": "\n".join(lines)}]}
+
+
 def home_view(user, st=None):
     """The persistent App Home tab: a status summary, a live state line, the
     active-user count, and the action buttons. `st` is a status dict from the
@@ -472,7 +516,7 @@ def home_view(user, st=None):
 
     if not user["enabled"]:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": t("home_blurb", lang)}})
-        for blk in (_active_users_block(st, lang), _stats_block(st, lang)):
+        for blk in (_active_users_block(st, lang), _stats_block(st, lang), _codex_block(st, lang)):
             if blk:
                 blocks.append(blk)
         blocks.append({"type": "actions", "elements": [
@@ -488,7 +532,7 @@ def home_view(user, st=None):
     if state_line:
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": state_line}]})
 
-    for blk in (_active_users_block(st, lang), _stats_block(st, lang)):
+    for blk in (_active_users_block(st, lang), _stats_block(st, lang), _codex_block(st, lang)):
         if blk:
             blocks.append(blk)
 

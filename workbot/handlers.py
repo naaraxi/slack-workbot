@@ -63,7 +63,8 @@ def _home_status(client, user):
     next expected check-in time."""
     st = {"away": False, "paused_until": None, "snooze_until": None, "next_ts": None,
           "in_hours": False, "active_users": db.active_count(),
-          "stats": db.event_counts(user["user_id"])}
+          "stats": db.event_counts(user["user_id"]),
+          "codex": suggest.usage_summary()}
     if not user.get("enabled") or not user.get("configured"):
         return st
     st["in_hours"] = scheduler.within_hours(user)
@@ -383,18 +384,21 @@ def register(app):
     # --- "free" DM (legacy alias for the buttons) -------------------------
 
     @app.event("message")
-    def on_message(event, client):
+    def on_message(event, client, context):
         # Never react to our own posts, message edits, joins, or other subtypes.
         if event.get("bot_id") or event.get("subtype"):
             return
-        # A reply inside a public-channel thread may be a report thread the user
-        # is pushing back on - let the suggester decide (it ignores any thread it
-        # didn't start, and anyone who isn't the user that thread is about).
+        # A reply inside a public-channel thread is handled only when it actually
+        # addresses the bot (@WorkBot ...), to keep it from reacting to every line
+        # of thread chatter. The suggester still ignores any thread it didn't start.
         thread_ts = event.get("thread_ts")
+        bot_id = context.get("bot_user_id")
         if (
             event.get("channel_type") == "channel"
             and thread_ts
             and thread_ts != event.get("ts")
+            and bot_id
+            and f"<@{bot_id}>" in (event.get("text") or "")
         ):
             suggest.spawn_followup(client, event)
             return

@@ -140,6 +140,34 @@ def meta_set(key, value):
         )
 
 
+def add_codex_tokens(n, resets_at):
+    """Add `n` tokens to the current cycle's running total (meta key
+    'codex_tokens_cycle'). The cycle is keyed to the weekly rate-limit window: when
+    `resets_at` differs from the stored one, a new window has begun and the count
+    restarts. Done in one transaction so concurrent runs don't lose increments."""
+    if not n:
+        return
+    key_at = str(resets_at) if resets_at is not None else ""
+    with _conn() as conn:
+        def _get(k):
+            r = conn.execute("SELECT value FROM meta WHERE key = ?", (k,)).fetchone()
+            return r["value"] if r else None
+
+        def _set(k, v):
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (k, str(v)),
+            )
+
+        # A changed reset time means a fresh window - start the count over.
+        if key_at and key_at != (_get("codex_cycle_resets_at") or ""):
+            _set("codex_cycle_resets_at", key_at)
+            _set("codex_tokens_cycle", n)
+        else:
+            _set("codex_tokens_cycle", int(_get("codex_tokens_cycle") or 0) + n)
+
+
 def get_user(user_id):
     with _conn() as conn:
         row = conn.execute(

@@ -39,6 +39,10 @@ CODEX_TIMEOUT = int(os.environ.get("WORKBOT_SUGGEST_TIMEOUT", "90"))
 FOLLOWUP_CONTEXT_MSGS = int(os.environ.get("WORKBOT_SUGGEST_CONTEXT_MSGS", "12"))
 FOLLOWUP_CONTEXT_CHARS = int(os.environ.get("WORKBOT_SUGGEST_CONTEXT_CHARS", "2000"))
 
+# Codex writes session rollouts (which carry the rate-limit snapshot behind
+# `/status`) under here; we read the newest one to surface account usage.
+CODEX_HOME = os.environ.get("CODEX_HOME", "/app/.codex-home")
+
 PRIORITY_EMOJI = {"Highest": "🔴", "High": "🟠", "Medium": "🟡", "Low": "🟢", "Lowest": "🔵"}
 
 
@@ -86,20 +90,86 @@ def _pref_clause(projects):
     )
 
 
-def _codex_run(prompt, listing):
+def _call_tokens(stdout):
+    """Total tokens for a run, from the `--json` turn.completed event (input +
+    output), or 0 if it can't be read."""
+    total = 0
+    for line in (stdout or "").splitlines():
+        if '"turn.completed"' not in line:
+            continue
+        try:
+            u = json.loads(line).get("usage") or {}
+            total = int(u.get("input_tokens") or 0) + int(u.get("output_tokens") or 0)
+        except Exception:
+            pass
+    return total
+
+
+def _latest_rate_limits():
+    """The most recent rate-limit snapshot Codex recorded (the data behind
+    `/status`), read from the newest session rollout, or None. Codex only writes
+    it to the rollout - there's no `codex usage` subcommand - so this is the way."""
+    sessions = os.path.join(CODEX_HOME, "sessions")
+    newest, newest_mtime = None, -1.0
+    for root, _dirs, files in os.walk(sessions):
+        for name in files:
+            if name.startswith("rollout-") and name.endswith(".jsonl"):
+                p = os.path.join(root, name)
+                try:
+                    m = os.path.getmtime(p)
+                except OSError:
+                    continue
+                if m > newest_mtime:
+                    newest, newest_mtime = p, m
+    if not newest:
+        return None
+    rl = None
+    try:
+        with open(newest) as f:
+            for line in f:
+                if '"token_count"' not in line:
+                    continue
+                payload = (json.loads(line).get("payload") or {})
+                if payload.get("rate_limits"):
+                    rl = payload["rate_limits"]  # keep the last one in the file
+    except Exception:
+        logger.exception("Could not read rate limits from %s", newest)
+    return rl
+
+
+def _record_usage(stdout, meter):
+    """After a Codex run: refresh the cached rate-limit snapshot, and (for metered
+    runs only) add this run's tokens to the current cycle's counter. The cycle is
+    keyed to the weekly rate-limit window, so it rolls over when that resets."""
+    rl = _latest_rate_limits()
+    resets_at = None
+    if rl:
+        db.meta_set("codex_rate_limits", json.dumps(rl))
+        resets_at = (rl.get("primary") or {}).get("resets_at")
+    if meter:
+        db.add_codex_tokens(_call_tokens(stdout), resets_at)
+
+
+def _codex_run(prompt, listing, meter=True):
     """Run one Codex turn with the candidate list on stdin; return its answer text
     (or '' on any failure). OPENAI_API_KEY is stripped from the child env so Codex
-    authenticates with the org subscription, not a personal API key."""
+    authenticates with the org subscription, not a personal API key. Every run
+    refreshes the usage snapshot; metered runs also count toward the token cycle
+    (the hourly usage poll passes meter=False so polling doesn't inflate it)."""
     env = {k: v for k, v in os.environ.items() if k != "OPENAI_API_KEY"}
     out_path = None
     try:
         with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
             out_path = f.name
-        subprocess.run(
-            ["codex", "exec", "--skip-git-repo-check", "-o", out_path, prompt],
+        proc = subprocess.run(
+            ["codex", "exec", "--skip-git-repo-check", "--json", "-o", out_path, prompt],
             input=listing, cwd="/tmp", env=env, text=True,
             capture_output=True, timeout=CODEX_TIMEOUT,
         )
+        try:
+            _record_usage(proc.stdout, meter)
+        except Exception:
+            logger.exception("Could not record Codex usage")
         with open(out_path) as f:
             return f.read()
     except Exception:
@@ -111,6 +181,47 @@ def _codex_run(prompt, listing):
                 os.unlink(out_path)
             except OSError:
                 pass
+
+
+def refresh_usage():
+    """Hourly: a tiny Codex query whose only purpose is to refresh the account's
+    rate-limit snapshot (so the Home tab's usage stays current even when the bot
+    makes no suggestions). Not metered - this poll shouldn't inflate the token
+    cycle. No-ops unless suggestions are enabled."""
+    if not enabled():
+        return
+    _codex_run("Reply with just: ok", "", meter=False)
+    logger.info("Refreshed Codex usage snapshot")
+
+
+def usage_summary():
+    """Display-ready Codex metrics for the Home tab, or None when nothing is known
+    yet: {tokens, percent, window_minutes, resets_at, plan, secondary?}."""
+    tokens = db.meta_get("codex_tokens_cycle")
+    raw = db.meta_get("codex_rate_limits")
+    if tokens is None and not raw:
+        return None
+    out = {"tokens": int(tokens) if tokens is not None else None}
+    if raw:
+        try:
+            rl = json.loads(raw)
+            primary = rl.get("primary") or {}
+            out.update({
+                "percent": primary.get("used_percent"),
+                "window_minutes": primary.get("window_minutes"),
+                "resets_at": primary.get("resets_at"),
+                "plan": rl.get("plan_type"),
+            })
+            secondary = rl.get("secondary")
+            if secondary:
+                out["secondary"] = {
+                    "percent": secondary.get("used_percent"),
+                    "window_minutes": secondary.get("window_minutes"),
+                    "resets_at": secondary.get("resets_at"),
+                }
+        except Exception:
+            logger.exception("Could not parse cached rate limits")
+    return out
 
 
 def _codex_pick(candidates, role, projects):
