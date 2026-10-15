@@ -37,6 +37,13 @@ IGNORE_THRESHOLD = int(os.environ.get("WORKBOT_IGNORE_THRESHOLD", "3"))
 # Delete the bot's own DM messages older than this many hours (0 = never).
 PRUNE_AFTER_HOURS = int(os.environ.get("WORKBOT_PRUNE_AFTER_HOURS", "24"))
 
+# Emoji reactions the bot pre-seeds on each report (comma-separated names).
+REPORT_REACTIONS = [
+    e.strip()
+    for e in os.environ.get("WORKBOT_REPORT_REACTIONS", "white_check_mark,eyes").split(",")
+    if e.strip()
+]
+
 # Status emojis that mean "leave me alone" (out of office). Configurable.
 _DEFAULT_SKIP_EMOJIS = ":palm_tree:,:face_with_thermometer:"
 SKIP_EMOJIS = {
@@ -397,11 +404,24 @@ def _flush_reports(client, report_channel, report_mention=""):
         logger.warning("No report channel configured; would have posted: %s", text)
         return
     try:
-        client.chat_postMessage(channel=report_channel, text=text)
+        resp = client.chat_postMessage(channel=report_channel, text=text)
     except Exception:
         logger.exception("Failed to post report; re-queuing %s", ids)
         with _pending_lock:
             _pending.update(ids)
+        return
+    # Pre-seed reactions so PMs can one-click to acknowledge / claim the task.
+    _add_reactions(client, resp["channel"], resp["ts"])
+
+
+def _add_reactions(client, channel, ts):
+    """Add the configured acknowledgement reactions to a report message."""
+    for emoji in REPORT_REACTIONS:
+        try:
+            client.reactions_add(channel=channel, timestamp=ts, name=emoji)
+        except Exception:
+            # A missing scope or an already-added reaction shouldn't break reports.
+            logger.exception("Could not add reaction :%s: to report", emoji)
 
 
 def _prune_dms(client):
