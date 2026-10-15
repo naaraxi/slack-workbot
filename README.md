@@ -19,8 +19,9 @@ it needs no public URL.
   - **Almost Done** - pick how much longer you need; it stays quiet until then.
   - **No** - WorkBot posts to the configured channel that you are free for a
     task.
-- Reports are batched into one channel message over a short window, and can
-  optionally mention a user group (for example your project managers).
+- A **No** posts to the channel immediately, one message per person, and can
+  optionally mention a user group (for example your project managers) and
+  pre-seed acknowledgement reactions.
 - An App Home tab shows your status, the next check-in time, and buttons to
   enable/disable, open settings, pause for the day, or check in now.
 
@@ -46,7 +47,9 @@ Create an app at <https://api.slack.com/apps> (from scratch is fine) and:
 1. **Socket Mode**: enable it, and generate an app-level token with the
    `connections:write` scope (this is your `SLACK_APP_TOKEN`, `xapp-...`).
 2. **OAuth & Permissions - Bot Token Scopes**: `commands`, `chat:write`,
-   `chat:write.public`, `im:write`, `im:history`, `users:read`. Add
+   `chat:write.public`, `im:write`, `im:history`, `users:read`,
+   `channels:read`, `channels:join` (so the bot can resolve and join the report
+   channel), and `reactions:write` (to pre-seed acknowledgement reactions). Add
    `usergroups:read` only if you want the report to mention a user group.
 3. **Event Subscriptions - bot events**: `message.im` and `app_home_opened`.
 4. **Slash Commands**: create `/workbot` (no request URL needed under Socket

@@ -79,6 +79,8 @@ DEFAULTS = {
         "tasks and I'll check in right away."
     ),
     "answer_no": "Thanks. I'll let the channel know you're free for a task.",
+    "answer_no_failed": "Thanks. I couldn't reach the channel just now - please let them know directly.",
+    "checkin_stale": "This check-in is no longer active.",
     "answer_almost": "Got it - I'll leave you alone for about {label}. Tap *I'm free now* if you finish sooner.",
     "free_ack_off_hours": "Noted - you're outside your working hours, so I'll check in when they next start.",
     "expired": "(This check-in expired - I'll ask again.)",
@@ -113,15 +115,20 @@ DEFAULTS = {
     "interval_field_label": "Check in every",
     "lang_field_label": "Language",
     "days_field_label": "Working days",
+    "jira_field_label": "Preferred projects",
+    "role_field_label": "Role",
     "settings_saved": (
         "Settings saved. Working hours: *{hours}* ({tz}), checking in every "
         "*{interval}*."
     ),
+    "settings_saved_jira": " Preferred projects: *{projects}*.",
     # Channel report (needs_task_one for a single person, needs_task_many for 2+).
     # report_prefix is prepended only when WORKBOT_REPORT_MENTION is set.
     "needs_task_one": "{mentions} needs a task!",
     "needs_task_many": "{mentions} need a task!",
     "report_prefix": "{mention} ✋ ",
+    # Header for the threaded task-suggestion reply.
+    "suggest_header": "Suggested tasks:",
     # Posted once, when the bot newly joins the report channel.
     "join_message": (
         ":wave: Hi, I'm *WorkBot*. I check in privately with people about whether "
@@ -135,6 +142,9 @@ INTERVAL_CHOICES = ["30", "60", "120", "180", "240"]
 
 # Display names for the language dropdown (shown in the language itself).
 LANG_NAMES = {"en": "English", "sv": "Svenska"}
+
+# Role options for the Settings multi-select (label == value).
+ROLE_CHOICES = ["Backend", "Frontend", "DevOps", "Design", "PM", "Sales", "Marketing", "HR", "All"]
 
 # Working-day checkboxes: (label, ISO weekday). Edit labels here to translate.
 DAY_CHOICES = [
@@ -249,6 +259,14 @@ def answer_no(lang=None):
     return t("answer_no", lang)
 
 
+def answer_no_failed(lang=None):
+    return t("answer_no_failed", lang)
+
+
+def checkin_stale(lang=None):
+    return t("checkin_stale", lang)
+
+
 def answer_almost(label, lang=None):
     return t("answer_almost", lang).format(label=label)
 
@@ -286,22 +304,34 @@ def answer_yes(user):
     return t("answer_yes", lang).format(interval=interval_label(user.get("interval_minutes") or 60))
 
 
+def _jira_suffix(user, lang):
+    """' Jira projects: *A, B*.' when some are selected, else ''."""
+    keys = [k for k in (user.get("jira_projects") or "").split(",") if k.strip()]
+    return t("settings_saved_jira", lang).format(projects=", ".join(keys)) if keys else ""
+
+
 def enabled_confirm(user):
     lang = user.get("lang")
-    return t("enabled_confirm", lang).format(hours=_hours_label(user), tz=user.get("tz") or "unknown")
+    msg = t("enabled_confirm", lang).format(hours=_hours_label(user), tz=user.get("tz") or "unknown")
+    return msg + _jira_suffix(user, lang)
 
 
 def settings_saved(user):
     lang = user.get("lang")
-    return t("settings_saved", lang).format(
+    msg = t("settings_saved", lang).format(
         hours=_hours_label(user),
         tz=user.get("tz") or "unknown",
         interval=interval_label(user.get("interval_minutes") or 60),
     )
+    return msg + _jira_suffix(user, lang)
 
 
 def join_message(lang=None):
     return t("join_message", lang)
+
+
+def suggest_header(lang=None):
+    return t("suggest_header", lang)
 
 
 def needs_task_text(user_ids, lang=None, mention=""):
@@ -526,7 +556,48 @@ def _days_input(user, lang):
     }
 
 
-def settings_modal(user, private_metadata="", lang=None):
+def _role_input(user, lang):
+    """Optional multi-select of the user's role(s), pre-filled from storage."""
+    cur = {r for r in (user.get("role") or "").split(",") if r.strip()}
+    opts = [_select_option(r, r) for r in ROLE_CHOICES]
+    element = {"type": "multi_static_select", "action_id": "role", "options": opts}
+    initial = [o for o in opts if o["value"] in cur]
+    if initial:
+        element["initial_options"] = initial
+    return {
+        "type": "input",
+        "block_id": "role_block",
+        "optional": True,
+        "label": {"type": "plain_text", "text": t("role_field_label", lang)},
+        "element": element,
+    }
+
+
+def _jira_input(user, lang, projects):
+    """Optional multi-select of Jira projects, built from the cached list.
+    Returns None when there are no projects to offer."""
+    if not projects:
+        return None
+    cur = {k for k in (user.get("jira_projects") or "").split(",") if k.strip()}
+    # Slack caps option text at 75 chars and allows up to 100 options.
+    opts = [
+        _select_option(f"{p['name']} ({p['key']})"[:75], p["key"])
+        for p in projects[:100]
+    ]
+    element = {"type": "multi_static_select", "action_id": "jira_projects", "options": opts}
+    initial = [o for o in opts if o["value"] in cur]
+    if initial:
+        element["initial_options"] = initial
+    return {
+        "type": "input",
+        "block_id": "jira_block",
+        "optional": True,  # not everyone uses the suggestion feature
+        "label": {"type": "plain_text", "text": t("jira_field_label", lang)},
+        "element": element,
+    }
+
+
+def settings_modal(user, private_metadata="", lang=None, jira_projects=None):
     """Working hours + check-in interval + language, pre-filled from the user."""
     lang = lang or user.get("lang") or DEFAULT_LANG
 
@@ -543,6 +614,51 @@ def settings_modal(user, private_metadata="", lang=None):
     cur_lang = lang if lang in LANGS else DEFAULT_LANG
     lang_initial = next(o for o in lang_opts if o["value"] == cur_lang)
 
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": t("hours_intro", lang)}},
+        {
+            "type": "input",
+            "block_id": "start_block",
+            "label": {"type": "plain_text", "text": t("modal_start_label", lang)},
+            "element": {"type": "timepicker", "action_id": "start", "initial_time": start_time},
+        },
+        {
+            "type": "input",
+            "block_id": "end_block",
+            "label": {"type": "plain_text", "text": t("modal_end_label", lang)},
+            "element": {"type": "timepicker", "action_id": "end", "initial_time": end_time},
+        },
+        _days_input(user, lang),
+        {
+            "type": "input",
+            "block_id": "interval_block",
+            "label": {"type": "plain_text", "text": t("interval_field_label", lang)},
+            "element": {
+                "type": "static_select",
+                "action_id": "interval",
+                "options": interval_opts,
+                "initial_option": interval_initial,
+            },
+        },
+        {
+            "type": "input",
+            "block_id": "lang_block",
+            "label": {"type": "plain_text", "text": t("lang_field_label", lang)},
+            "element": {
+                "type": "static_select",
+                "action_id": "lang",
+                "options": lang_opts,
+                "initial_option": lang_initial,
+            },
+        },
+        _role_input(user, lang),
+    ]
+
+    # Jira project multi-select, only when a project list is cached.
+    jira_block = _jira_input(user, lang, jira_projects)
+    if jira_block:
+        blocks.append(jira_block)
+
     return {
         "type": "modal",
         "callback_id": "wb_settings_modal",
@@ -550,44 +666,7 @@ def settings_modal(user, private_metadata="", lang=None):
         "title": {"type": "plain_text", "text": t("modal_title", lang)},
         "submit": {"type": "plain_text", "text": t("modal_submit", lang)},
         "close": {"type": "plain_text", "text": t("modal_cancel", lang)},
-        "blocks": [
-            {"type": "section", "text": {"type": "mrkdwn", "text": t("hours_intro", lang)}},
-            {
-                "type": "input",
-                "block_id": "start_block",
-                "label": {"type": "plain_text", "text": t("modal_start_label", lang)},
-                "element": {"type": "timepicker", "action_id": "start", "initial_time": start_time},
-            },
-            {
-                "type": "input",
-                "block_id": "end_block",
-                "label": {"type": "plain_text", "text": t("modal_end_label", lang)},
-                "element": {"type": "timepicker", "action_id": "end", "initial_time": end_time},
-            },
-            _days_input(user, lang),
-            {
-                "type": "input",
-                "block_id": "interval_block",
-                "label": {"type": "plain_text", "text": t("interval_field_label", lang)},
-                "element": {
-                    "type": "static_select",
-                    "action_id": "interval",
-                    "options": interval_opts,
-                    "initial_option": interval_initial,
-                },
-            },
-            {
-                "type": "input",
-                "block_id": "lang_block",
-                "label": {"type": "plain_text", "text": t("lang_field_label", lang)},
-                "element": {
-                    "type": "static_select",
-                    "action_id": "lang",
-                    "options": lang_opts,
-                    "initial_option": lang_initial,
-                },
-            },
-        ],
+        "blocks": blocks,
     }
 
 

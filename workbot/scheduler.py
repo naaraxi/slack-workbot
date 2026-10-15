@@ -1,10 +1,11 @@
 """The proactive side of WorkBot.
 
-Two background jobs:
+One background job:
   - check-in tick (every 60s): DM each eligible user the Yes/No/Almost Done
     question when their interval is due, during their working hours.
-  - report flush (every WORKBOT_REPORT_FLUSH_SECONDS): post one combined
-    "needs a task" message for everyone who answered No since the last flush.
+
+Reports post immediately: when a user answers No, one "needs a task" message is
+sent to the configured channel right away (no batching).
 
 Silent by default: the tick only ever iterates db.enabled_users(), i.e. users
 who ran /workbot, enabled it, and set working hours. It also skips users who
@@ -12,24 +13,24 @@ are out of office (status emoji), snoozed (Almost Done), outside working
 hours, or paused after ignoring several check-ins in a row.
 """
 
+import json
 import logging
 import os
 import re
-import threading
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from . import db, messages
+from . import db, jira, messages, suggest
 
 logger = logging.getLogger("workbot")
 
-# user_ids who answered No and are waiting to be reported, guarded by a lock
-_pending = set()
-_pending_lock = threading.Lock()
-
 PLACEHOLDER_CHANNEL = "C0000000000"
+
+# Report destination, set once in start(); reports are posted per user on No.
+_report_channel = ""
+_report_mention = ""
 
 # Consecutive ignored check-ins before the bot pauses a user for the day.
 IGNORE_THRESHOLD = int(os.environ.get("WORKBOT_IGNORE_THRESHOLD", "3"))
@@ -51,11 +52,6 @@ SKIP_EMOJIS = {
     for e in os.environ.get("WORKBOT_SKIP_STATUS_EMOJIS", _DEFAULT_SKIP_EMOJIS).split(",")
     if e.strip()
 }
-
-
-def add_pending(user_id):
-    with _pending_lock:
-        _pending.add(user_id)
 
 
 def resolve_report_mention(client, handle):
@@ -178,8 +174,9 @@ def within_hours(user):
     try:
         now_local = _now_utc().astimezone(ZoneInfo(tz))
     except Exception:
-        logger.exception("Bad tz %r for %s; treating as always in-hours", tz, user["user_id"])
-        return True
+        # Fail closed: a broken timezone must not mean "contact at any hour".
+        logger.exception("Bad tz %r for %s; treating as OUTSIDE hours", tz, user["user_id"])
+        return False
     if now_local.isoweekday() not in work_days(user):
         return False  # not a working day for this user
     mins = now_local.hour * 60 + now_local.minute
@@ -387,31 +384,32 @@ def _tick(client):
             logger.exception("check-in failed for %s", user.get("user_id"))
 
 
-def _flush_reports(client, report_channel, report_mention=""):
-    with _pending_lock:
-        if not _pending:
-            return
-        ids = list(_pending)
-        _pending.clear()
+def report_user(client, user_id):
+    """Post a 'needs a task' message for one user to the report channel, now.
 
-    # Drop anyone who went out of office between answering and this flush.
-    ids = [u for u in ids if not is_unavailable(client, u)]
-    if not ids:
-        return
+    Called from the No handler, so it fires immediately (no batching). Returns
+    `(channel, ts)` of the posted message on success (so suggestions can thread
+    under it), True when intentionally skipped (no channel, or the user is out of
+    office), and False only when posting actually failed - so the handler can
+    tell the user honestly instead of claiming it was reported.
+    """
+    if not _report_channel or _report_channel == PLACEHOLDER_CHANNEL:
+        logger.warning("No report channel configured; would report %s", user_id)
+        return True  # misconfiguration, not a transient failure
+    if is_unavailable(client, user_id):
+        return True  # don't call out someone who's marked away
 
-    text = messages.needs_task_text(ids, mention=report_mention)
-    if not report_channel or report_channel == PLACEHOLDER_CHANNEL:
-        logger.warning("No report channel configured; would have posted: %s", text)
-        return
-    try:
-        resp = client.chat_postMessage(channel=report_channel, text=text)
-    except Exception:
-        logger.exception("Failed to post report; re-queuing %s", ids)
-        with _pending_lock:
-            _pending.update(ids)
-        return
-    # Pre-seed reactions so PMs can one-click to acknowledge / claim the task.
-    _add_reactions(client, resp["channel"], resp["ts"])
+    text = messages.needs_task_text([user_id], mention=_report_mention)
+    # Retry once: a single transient Slack/network hiccup shouldn't drop a report.
+    for attempt in (1, 2):
+        try:
+            resp = client.chat_postMessage(channel=_report_channel, text=text)
+            # Pre-seed reactions so PMs can one-click to acknowledge / claim it.
+            _add_reactions(client, resp["channel"], resp["ts"])
+            return (resp["channel"], resp["ts"])
+        except Exception:
+            logger.exception("Report post failed for %s (attempt %d/2)", user_id, attempt)
+    return False
 
 
 def _add_reactions(client, channel, ts):
@@ -465,22 +463,38 @@ def _prune_dms(client):
             logger.exception("prune failed for %s", uid)
 
 
-def start(client, report_channel, flush_seconds=60, report_mention=""):
+def refresh_jira_projects():
+    """Fetch the Jira project list and cache it (as JSON in meta) for the
+    Settings dropdown. No-op when Jira isn't configured; keeps the old cache on
+    a failed fetch so the dropdown never empties out."""
+    if not jira.configured():
+        return
+    projects = jira.fetch_projects()
+    if projects:
+        db.meta_set("jira_projects", json.dumps(projects))
+        logger.info("Cached %d Jira projects", len(projects))
+
+
+def start(client, report_channel, report_mention=""):
+    # Stash the report destination so the (immediate) No handler can use it.
+    global _report_channel, _report_mention
+    _report_channel = report_channel
+    _report_mention = report_mention
+
+    refresh_jira_projects()  # populate the dropdown cache before anyone opens Settings
+    suggest.refresh_candidates()  # populate the suggestion pool at startup
+
     sched = BackgroundScheduler(timezone="UTC")
     sched.add_job(lambda: _tick(client), "interval", seconds=60, id="checkin")
-    sched.add_job(
-        lambda: _flush_reports(client, report_channel, report_mention),
-        "interval",
-        seconds=flush_seconds,
-        id="flush",
-    )
     if PRUNE_AFTER_HOURS > 0:
         sched.add_job(lambda: _prune_dms(client), "interval", seconds=3600, id="prune")
+    if jira.configured():
+        # Refresh the project list daily, and the unassigned-task pool hourly.
+        sched.add_job(refresh_jira_projects, "interval", seconds=86400, id="jira_projects")
+        sched.add_job(suggest.refresh_candidates, "interval", seconds=3600, id="jira_candidates")
     sched.start()
     logger.info(
-        "Scheduler started (check-in 60s, report flush %ss, ignore threshold %s, "
-        "prune DMs after %sh, channel=%s)",
-        flush_seconds,
+        "Scheduler started (check-in 60s, ignore threshold %s, prune DMs after %sh, channel=%s)",
         IGNORE_THRESHOLD,
         PRUNE_AFTER_HOURS or "off",
         report_channel or "unset",

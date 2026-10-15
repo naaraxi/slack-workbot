@@ -17,8 +17,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("workbot")
 
 REPORT_CHANNEL = os.environ.get("WORKBOT_REPORT_CHANNEL", "")
-# Window over which "No" answers are batched into one channel message.
-REPORT_FLUSH_SECONDS = int(os.environ.get("WORKBOT_REPORT_FLUSH_SECONDS", "600"))
 # Optional user-group handle to ping on reports (resolved to a subteam ID,
 # which is cached in the DB). Empty = no prefix.
 REPORT_GROUP = os.environ.get("WORKBOT_REPORT_GROUP", "")
@@ -33,12 +31,7 @@ def main():
     messages.write_templates()
     scheduler.ensure_in_channel(app.client, REPORT_CHANNEL)
     report_mention = scheduler.resolve_report_mention(app.client, REPORT_GROUP)
-    scheduler.start(
-        app.client,
-        REPORT_CHANNEL,
-        flush_seconds=REPORT_FLUSH_SECONDS,
-        report_mention=report_mention,
-    )
+    scheduler.start(app.client, REPORT_CHANNEL, report_mention=report_mention)
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     logger.info("Starting WorkBot (Socket Mode)...")
     handler.start()

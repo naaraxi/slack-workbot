@@ -8,7 +8,7 @@ import os
 import urllib.request
 from datetime import datetime, timedelta
 
-from . import db, messages, scheduler
+from . import db, messages, scheduler, suggest
 from .scheduler import _now_utc, within_hours
 from .util import hhmm_to_minutes
 
@@ -92,6 +92,17 @@ def _publish_home(client, user_id):
         logger.exception("views_publish failed for %s", user_id)
 
 
+def _stale_checkin(user, msg_ts):
+    """True if a clicked check-in is not the user's current, answerable one -
+    they've since disabled the bot, already answered, or it's an old message.
+    Used to reject stale buttons before opening a modal."""
+    if not user or not user.get("enabled"):
+        return True
+    if not user.get("awaiting_reply"):
+        return True
+    return msg_ts != user.get("last_msg_ts")
+
+
 def _trigger_checkin_now(client, user_id):
     """Shared 'check me in now' action (Home button, contextual buttons, and the
     legacy `free` DM). Honours the cooldown; resumes any pause/snooze; sends a
@@ -138,15 +149,17 @@ def _user_tz_lang(client, user_id):
         return "UTC", messages.DEFAULT_LANG
 
 
-def _open_settings(client, body, user):
-    """Open the settings modal, pre-filled, carrying the card's response_url."""
+def _open_settings(client, body, user, enable):
+    """Open the settings modal, pre-filled. private_metadata carries the card's
+    response_url plus whether saving should enable the bot - True only when this
+    was opened via Enable (first-run), so a plain Settings edit never enables."""
     _, loc_lang = _user_tz_lang(client, user["user_id"])
+    pm = json.dumps({"url": body.get("response_url", ""), "enable": bool(enable)})
+    projects = json.loads(db.meta_get("jira_projects") or "[]")  # cached daily
     client.views_open(
         trigger_id=body["trigger_id"],
         view=messages.settings_modal(
-            user,
-            private_metadata=body.get("response_url", ""),
-            lang=user.get("lang") or loc_lang,
+            user, private_metadata=pm, lang=user.get("lang") or loc_lang, jira_projects=projects
         ),
     )
 
@@ -173,7 +186,7 @@ def register(app):
         user_id = body["user"]["id"]
         user = db.ensure_user(user_id, default_interval=DEFAULT_INTERVAL)
         if not user["configured"]:
-            _open_settings(client, body, user)  # first run: collect settings
+            _open_settings(client, body, user, enable=True)  # first run: enable on save
             return
         db.set_enabled(user_id, True)
         db.resume(user_id)  # clear any stale pause/ignore state
@@ -196,7 +209,7 @@ def register(app):
         ack()
         user_id = body["user"]["id"]
         user = db.ensure_user(user_id, default_interval=DEFAULT_INTERVAL)
-        _open_settings(client, body, user)
+        _open_settings(client, body, user, enable=False)  # editing settings never enables
 
     @app.view("wb_settings_modal")
     def on_settings_submit(ack, body, view, client):
@@ -208,6 +221,12 @@ def register(app):
         lang = values["lang_block"]["lang"]["selected_option"]["value"]
         day_opts = values["days_block"]["days"].get("selected_options") or []
         days = sorted(o["value"] for o in day_opts)
+        # Jira project multi-select (optional, and only present when cached).
+        jira_opts = values.get("jira_block", {}).get("jira_projects", {}).get("selected_options") or []
+        jira_keys = [o["value"] for o in jira_opts]
+        # Role multi-select (optional).
+        role_opts = values.get("role_block", {}).get("role", {}).get("selected_options") or []
+        roles = [o["value"] for o in role_opts]
         start_min = hhmm_to_minutes(start)
         end_min = hhmm_to_minutes(end)
 
@@ -221,19 +240,23 @@ def register(app):
             return
 
         ack()
-        user = db.ensure_user(user_id, default_interval=DEFAULT_INTERVAL)
-        first_setup = not user["configured"]
+        # private_metadata carries the card URL and whether to enable on save.
+        pm = json.loads(view.get("private_metadata") or "{}")
+        enable_intent = bool(pm.get("enable"))
+        db.ensure_user(user_id, default_interval=DEFAULT_INTERVAL)
         tz, _ = _user_tz_lang(client, user_id)
         db.set_working_hours(user_id, tz, start_min, end_min)
         db.set_interval(user_id, int(interval))
         db.set_lang(user_id, lang)
         db.set_work_days(user_id, ",".join(days))
-        if first_setup:
+        db.set_jira_projects(user_id, ",".join(jira_keys))
+        db.set_role(user_id, ",".join(roles))
+        if enable_intent:
             db.set_enabled(user_id, True)
 
-        _delete_card(view.get("private_metadata"))
+        _delete_card(pm.get("url"))
         fresh = db.get_user(user_id)
-        if first_setup:
+        if enable_intent:
             _dm(client, user_id, messages.enabled_confirm(fresh))
         else:
             _dm(client, user_id, messages.settings_saved(fresh))
@@ -245,6 +268,12 @@ def register(app):
     def on_yes(ack, body, client):
         ack()
         user_id = body["user"]["id"]
+        # Atomic claim: rejects a disabled user, an already-answered or an old
+        # check-in, and de-dupes concurrent/repeat clicks.
+        if not db.claim_checkin(user_id, body.get("message", {}).get("ts")):
+            user = db.get_user(user_id)
+            _update_message(client, body, messages.checkin_stale(user.get("lang") if user else None))
+            return
         user = db.get_user(user_id) or {}
         db.record_answer(user_id, "yes")
         db.record_event(user_id, "yes")  # log for stats / export
@@ -255,15 +284,31 @@ def register(app):
     def on_no(ack, body, client):
         ack()
         user_id = body["user"]["id"]
+        if not db.claim_checkin(user_id, body.get("message", {}).get("ts")):
+            user = db.get_user(user_id)
+            _update_message(client, body, messages.checkin_stale(user.get("lang") if user else None))
+            return
         user = db.get_user(user_id) or {}
         db.record_answer(user_id, "no")
         db.record_event(user_id, "no")  # log for stats / export
-        scheduler.add_pending(user_id)
-        _update_message(client, body, messages.answer_no(user.get("lang")))
+        # (channel, ts) on success, True if skipped, False if the post failed.
+        result = scheduler.report_user(client, user_id)
+        text = messages.answer_no_failed(user.get("lang")) if result is False else messages.answer_no(user.get("lang"))
+        _update_message(client, body, text)
+        # If the notification posted, suggest tasks as a threaded reply (async).
+        if isinstance(result, tuple):
+            suggest.spawn(client, user_id, result[0], result[1])
 
     @app.action("wb_almost")
     def on_almost(ack, body, client):
         ack()
+        user_id = body["user"]["id"]
+        # Read-only stale check before opening the modal; the real claim happens
+        # on submit so cancelling the modal leaves the check-in still open.
+        user = db.get_user(user_id)
+        if _stale_checkin(user, body.get("message", {}).get("ts")):
+            _update_message(client, body, messages.checkin_stale(user.get("lang") if user else None))
+            return
         pm = json.dumps(
             {"channel": body["channel"]["id"], "ts": body["message"]["ts"]}
         )
@@ -276,6 +321,10 @@ def register(app):
     def on_almost_submit(ack, body, view, client):
         ack()
         user_id = body["user"]["id"]
+        pm = json.loads(view.get("private_metadata") or "{}")
+        # Claim now: the check-in may have been superseded while the modal was open.
+        if not db.claim_checkin(user_id, pm.get("ts")):
+            return
         user = db.get_user(user_id) or {}
         minutes = int(
             view["state"]["values"]["dur_block"]["dur"]["selected_option"]["value"]
@@ -285,7 +334,7 @@ def register(app):
         db.set_snooze(user_id, (_now_utc() + timedelta(minutes=minutes)).isoformat())
 
         text = messages.answer_almost(messages.almost_label(minutes), user.get("lang"))
-        pm = json.loads(view.get("private_metadata") or "{}")
+        # pm (channel + ts of the check-in message) was parsed above; reuse it.
         if pm.get("channel") and pm.get("ts"):
             try:
                 client.chat_update(
@@ -335,9 +384,22 @@ def register(app):
 
     @app.event("message")
     def on_message(event, client):
-        if event.get("channel_type") != "im":
-            return
+        # Never react to our own posts, message edits, joins, or other subtypes.
         if event.get("bot_id") or event.get("subtype"):
+            return
+        # A reply inside a public-channel thread may be a report thread the user
+        # is pushing back on - let the suggester decide (it ignores any thread it
+        # didn't start, and anyone who isn't the user that thread is about).
+        thread_ts = event.get("thread_ts")
+        if (
+            event.get("channel_type") == "channel"
+            and thread_ts
+            and thread_ts != event.get("ts")
+        ):
+            suggest.spawn_followup(client, event)
+            return
+        # Otherwise only the "free" DM keyword does anything.
+        if event.get("channel_type") != "im":
             return
         user_id = event.get("user")
         text = (event.get("text") or "").strip().lower()

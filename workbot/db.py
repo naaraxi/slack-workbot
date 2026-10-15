@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS users (
     last_reset_day      TEXT,                         -- local 'YYYY-MM-DD' of last daily reset
     lang                TEXT,                         -- language code, e.g. 'en' / 'sv'
     last_free           TEXT,                         -- ISO-8601 UTC of last accepted 'free' DM
+    jira_projects       TEXT,                         -- CSV of Jira project keys for suggestions
+    role                TEXT,                         -- CSV of roles (Backend, Frontend, ...)
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL
 );
@@ -54,6 +56,8 @@ _MIGRATIONS = {
     "lang": "TEXT",
     "last_free": "TEXT",
     "work_days": "TEXT DEFAULT '1,2,3,4,5'",
+    "jira_projects": "TEXT",
+    "role": "TEXT",
 }
 
 
@@ -92,6 +96,21 @@ CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id);
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 """
 
+# One row per report thread we posted suggestions in, so a later reply in that
+# thread can be matched to the user it is about and answered with a re-suggest.
+# `suggested` accumulates the keys already offered (so we don't repeat them) and
+# `replies` counts the bot's own follow-ups, to cap the back-and-forth.
+REPORT_THREADS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS report_threads (
+    channel    TEXT NOT NULL,
+    thread_ts  TEXT NOT NULL,
+    user_id    TEXT NOT NULL,
+    suggested  TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (channel, thread_ts)
+);
+"""
+
 
 def init_db():
     with _conn() as conn:
@@ -99,6 +118,7 @@ def init_db():
         conn.executescript(SCHEMA)
         conn.executescript(META_SCHEMA)
         conn.executescript(EVENTS_SCHEMA)
+        conn.executescript(REPORT_THREADS_SCHEMA)
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(users)")}
         for col, decl in _MIGRATIONS.items():
             if col not in existing:
@@ -181,6 +201,14 @@ def set_work_days(user_id, days_csv):
     _update(user_id, work_days=days_csv)
 
 
+def set_jira_projects(user_id, keys_csv):
+    _update(user_id, jira_projects=keys_csv)
+
+
+def set_role(user_id, roles_csv):
+    _update(user_id, role=roles_csv)
+
+
 def set_last_free(user_id, when_iso):
     _update(user_id, last_free=when_iso)
 
@@ -210,6 +238,22 @@ def record_sent(user_id, channel, ts):
     )
 
 
+def claim_checkin(user_id, msg_ts):
+    """Atomically mark the current check-in as answered, but only if `msg_ts` is
+    that user's outstanding check-in and they are still enabled. Returns True at
+    most once per check-in, so concurrent or repeated clicks can't double-record.
+    """
+    if not msg_ts:
+        return False
+    with _conn() as conn:
+        cur = conn.execute(
+            "UPDATE users SET awaiting_reply = 0, updated_at = ? "
+            "WHERE user_id = ? AND enabled = 1 AND awaiting_reply = 1 AND last_msg_ts = ?",
+            (utcnow_iso(), user_id, msg_ts),
+        )
+        return cur.rowcount == 1
+
+
 def record_answer(user_id, answer):
     """The user answered: clear the outstanding flag, ignore counter, pause."""
     _update(
@@ -223,6 +267,49 @@ def record_answer(user_id, answer):
 
 def bump_ignored(user_id, count):
     _update(user_id, consecutive_ignored=count)
+
+
+# --- report threads (for in-thread follow-ups) ---------------------------
+
+def record_report_thread(channel, thread_ts, user_id, suggested_csv):
+    """Remember that we suggested tasks in this thread, so a later reply can be
+    matched to the user it's about. Replaces any prior row for the thread."""
+    with _conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO report_threads "
+            "(channel, thread_ts, user_id, suggested, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (channel, thread_ts, user_id, suggested_csv or "", utcnow_iso()),
+        )
+
+
+def get_report_thread(channel, thread_ts):
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM report_threads WHERE channel = ? AND thread_ts = ?",
+            (channel, thread_ts),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def add_thread_suggested(channel, thread_ts, keys):
+    """Append newly offered keys to the thread's accumulated 'already suggested'
+    set, so later follow-ups don't repeat them."""
+    if not keys:
+        return
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT suggested FROM report_threads WHERE channel = ? AND thread_ts = ?",
+            (channel, thread_ts),
+        ).fetchone()
+        if not row:
+            return
+        have = [k for k in (row["suggested"] or "").split(",") if k]
+        merged = have + [k for k in keys if k not in have]
+        conn.execute(
+            "UPDATE report_threads SET suggested = ? WHERE channel = ? AND thread_ts = ?",
+            (",".join(merged), channel, thread_ts),
+        )
 
 
 def set_paused(user_id, until_iso):

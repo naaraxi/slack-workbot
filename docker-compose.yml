@@ -6,3 +6,5 @@ services:
     env_file: .env
     volumes:
       - ./data:/data
+      # Dedicated Codex home (auth.json + minimal config), writable for token refresh.
+      - ./.codex-home:/app/.codex-home

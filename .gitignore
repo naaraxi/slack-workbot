@@ -5,3 +5,9 @@ __pycache__/
 
 # exported data
 *.csv
+
+# jira api token
+.jira
+
+# codex auth + config for the container
+.codex-home/
