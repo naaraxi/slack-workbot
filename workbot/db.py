@@ -58,6 +58,8 @@ _MIGRATIONS = {
     "work_days": "TEXT DEFAULT '1,2,3,4,5'",
     "jira_projects": "TEXT",
     "role": "TEXT",
+    "jira_account_id": "TEXT",  # resolved from the Slack email, cached for assignment detection
+    "jira_email": "TEXT",       # the email it was resolved from (for reference / re-verification)
 }
 
 
@@ -385,6 +387,17 @@ def enabled_users():
             "SELECT * FROM users WHERE enabled = 1 AND configured = 1"
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def all_users():
+    """Every known user row, regardless of enabled/configured state."""
+    with _conn() as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM users").fetchall()]
+
+
+def set_jira_identity(user_id, account_id, email):
+    """Cache a user's resolved Jira accountId (+ the email it came from)."""
+    _update(user_id, jira_account_id=account_id, jira_email=email)
 
 
 def active_count():

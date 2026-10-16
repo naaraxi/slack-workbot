@@ -29,15 +29,77 @@ def _auth_header():
     return "Basic " + base64.b64encode(raw).decode()
 
 
-# Unassigned, actionable, non-trivial work across all projects (filtered per
-# user by project later). Priority-ordered so a truncated fetch keeps the top.
-CANDIDATE_JQL = (
-    'assignee IS EMPTY AND statusCategory = "To Do" '
-    "AND issuetype NOT IN (Epic, Sub-task) "
-    # Low/Lowest are included but sorted to the bottom by priority DESC, so they
-    # only surface as a last resort when nothing better fits the role.
-    "ORDER BY priority DESC, created ASC"
-)
+def _csv_env(var):
+    """A comma-separated env var as a clean list of values."""
+    return [s.strip() for s in os.environ.get(var, "").split(",") if s.strip()]
+
+
+def _jql_name_list(names):
+    """Quote a list of status names for a JQL IN/NOT IN clause."""
+    return ", ".join('"' + n.replace('"', '\\"') + '"' for n in names)
+
+
+def _status_clause():
+    """Which statuses count as candidate-eligible, configurable from the env:
+
+    - WORKBOT_CANDIDATE_STATUSES: allowlist -> `status IN (...)`.
+    - WORKBOT_CANDIDATE_EXCLUDE_STATUSES: denylist, always subtracted.
+    - neither set -> `statusCategory = "To Do"`, the robust default that works
+      across projects without naming each project's own status strings.
+    """
+    include = _csv_env("WORKBOT_CANDIDATE_STATUSES")
+    exclude = _csv_env("WORKBOT_CANDIDATE_EXCLUDE_STATUSES")
+    base = f"status IN ({_jql_name_list(include)})" if include else 'statusCategory = "To Do"'
+    return f"{base} AND status NOT IN ({_jql_name_list(exclude)})" if exclude else base
+
+
+def candidate_jql():
+    """Unassigned, actionable, non-trivial work across all projects (filtered per
+    user by project later). Priority-ordered so a truncated fetch keeps the top.
+    Low/Lowest stay in but sort to the bottom, surfacing only as a last resort."""
+    return (
+        f"assignee IS EMPTY AND {_status_clause()} "
+        "AND issuetype NOT IN (Epic, Sub-task) "
+        "ORDER BY priority DESC, created ASC"
+    )
+
+
+def _get(path):
+    req = urllib.request.Request(
+        BASE_URL + path, method="GET",
+        headers={"Authorization": _auth_header(), "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.load(resp)
+
+
+def search_user_by_email(email):
+    """Resolve a work email to a Jira accountId via user search, or None. Prefers
+    an exact, active atlassian account; when Jira hides emails (privacy settings)
+    and returns a single match, trusts that. Returns (account_id, matched_email)."""
+    if not (configured() and email):
+        return None
+    import urllib.parse
+    try:
+        results = _get("/rest/api/3/user/search?query=" + urllib.parse.quote(email))
+    except Exception:
+        logger.exception("Jira user search failed for %s", email)
+        return None
+    if not results:
+        return None
+    target = email.strip().lower()
+    # Prefer an exact email match on a real, active user.
+    for u in results:
+        if (u.get("emailAddress") or "").strip().lower() == target \
+           and u.get("active") and u.get("accountType") == "atlassian":
+            return (u["accountId"], u.get("emailAddress"))
+    # Email hidden or no exact hit: accept a lone atlassian result (the query
+    # already matched server-side on the email).
+    atlassian = [u for u in results if u.get("accountType") == "atlassian"]
+    if len(atlassian) == 1:
+        u = atlassian[0]
+        return (u["accountId"], u.get("emailAddress"))
+    return None  # ambiguous - don't guess
 
 
 def _post(path, body):
@@ -64,7 +126,7 @@ def fetch_candidates(limit=500):
     try:
         # Enhanced JQL search paginates by nextPageToken.
         while len(out) < limit:
-            body = {"jql": CANDIDATE_JQL, "fields": ["key", "summary", "priority", "project"],
+            body = {"jql": candidate_jql(), "fields": ["key", "summary", "priority", "project"],
                     "maxResults": min(100, limit - len(out))}
             if token:
                 body["nextPageToken"] = token
