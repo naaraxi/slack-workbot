@@ -100,14 +100,16 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 
 # One row per report thread we posted suggestions in, so a later reply in that
 # thread can be matched to the user it is about and answered with a re-suggest.
-# `suggested` accumulates the keys already offered (so we don't repeat them) and
-# `replies` counts the bot's own follow-ups, to cap the back-and-forth.
+# `suggested` accumulates the keys already offered (so we don't repeat them).
+# `resolved` closes a thread out of the assignment watch: set when we announce an
+# assignment, or when a newer No for the same user supersedes this one.
 REPORT_THREADS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS report_threads (
     channel    TEXT NOT NULL,
     thread_ts  TEXT NOT NULL,
     user_id    TEXT NOT NULL,
     suggested  TEXT NOT NULL DEFAULT '',
+    resolved   INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     PRIMARY KEY (channel, thread_ts)
 );
@@ -125,6 +127,10 @@ def init_db():
         for col, decl in _MIGRATIONS.items():
             if col not in existing:
                 conn.execute(f"ALTER TABLE users ADD COLUMN {col} {decl}")
+        # Add report_threads.resolved to tables created before the assignment watch.
+        rt_cols = {row["name"] for row in conn.execute("PRAGMA table_info(report_threads)")}
+        if "resolved" not in rt_cols:
+            conn.execute("ALTER TABLE report_threads ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0")
 
 
 def meta_get(key):
@@ -303,14 +309,70 @@ def bump_ignored(user_id, count):
 
 def record_report_thread(channel, thread_ts, user_id, suggested_csv):
     """Remember that we suggested tasks in this thread, so a later reply can be
-    matched to the user it's about. Replaces any prior row for the thread."""
+    matched to the user it's about. Replaces any prior row for the thread, and
+    supersedes (resolves) the user's older open threads so the assignment watch
+    only ever tracks their most recent No."""
     with _conn() as conn:
         conn.execute(
+            "UPDATE report_threads SET resolved = 1 WHERE user_id = ? AND resolved = 0",
+            (user_id,),
+        )
+        conn.execute(
             "INSERT OR REPLACE INTO report_threads "
-            "(channel, thread_ts, user_id, suggested, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "(channel, thread_ts, user_id, suggested, resolved, created_at) "
+            "VALUES (?, ?, ?, ?, 0, ?)",
             (channel, thread_ts, user_id, suggested_csv or "", utcnow_iso()),
         )
+
+
+def watched_report_threads(since_iso=None):
+    """Each user's most recent still-open report thread - the set the assignment
+    watch polls. At most one row per user. `since_iso` bounds it to recent threads
+    (today's), so the watch never chases stale older notifications."""
+    with _conn() as conn:
+        if since_iso:
+            rows = conn.execute(
+                "SELECT * FROM report_threads t WHERE resolved = 0 AND created_at >= ? "
+                "AND created_at = (SELECT MAX(created_at) FROM report_threads "
+                "  WHERE user_id = t.user_id AND resolved = 0 AND created_at >= ?)",
+                (since_iso, since_iso),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM report_threads t WHERE resolved = 0 AND created_at = ("
+                "  SELECT MAX(created_at) FROM report_threads"
+                "  WHERE user_id = t.user_id AND resolved = 0)"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def resolve_old_threads(before_iso):
+    """Retire still-open report threads created before `before_iso`, so the
+    assignment watch never walks back onto yesterday's notifications."""
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE report_threads SET resolved = 1 WHERE resolved = 0 AND created_at < ?",
+            (before_iso,),
+        )
+
+
+def resolve_report_thread(channel, thread_ts):
+    with _conn() as conn:
+        conn.execute(
+            "UPDATE report_threads SET resolved = 1 WHERE channel = ? AND thread_ts = ?",
+            (channel, thread_ts),
+        )
+
+
+def slack_for_jira_account(account_id):
+    """Reverse-map a Jira accountId back to a Slack user_id, or None."""
+    if not account_id:
+        return None
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT user_id FROM users WHERE jira_account_id = ? LIMIT 1", (account_id,)
+        ).fetchone()
+        return row["user_id"] if row else None
 
 
 def get_report_thread(channel, thread_ts):

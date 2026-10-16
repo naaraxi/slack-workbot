@@ -9,7 +9,9 @@ import base64
 import json
 import logging
 import os
+import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta
 
 logger = logging.getLogger("workbot")
 
@@ -176,3 +178,87 @@ def fetch_projects():
     except Exception:
         logger.exception("Jira project fetch failed")
         return []
+
+
+def _dt(s):
+    """Parse an ISO-8601 timestamp (ours, or Jira's '+0000' form) to an aware
+    datetime, or None. Python 3.11+ fromisoformat handles both."""
+    try:
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _assignee_change_after(issue_key, account_id, after_iso):
+    """The most recent change that set this issue's assignee to account_id, if it
+    happened strictly after after_iso. Returns {created, by_account, by_name,
+    from_name} or None. The exact time check lives here (not in JQL) to dodge
+    JQL's timezone-sensitive date parsing."""
+    after = _dt(after_iso)
+    try:
+        data = _get(f"/rest/api/3/issue/{urllib.parse.quote(issue_key)}?expand=changelog&fields=summary")
+    except Exception:
+        logger.exception("changelog fetch failed for %s", issue_key)
+        return None
+    latest = None
+    for h in data.get("changelog", {}).get("histories", []):
+        created = _dt(h.get("created", ""))
+        if not created or (after and created <= after):
+            continue
+        for it in h.get("items", []):
+            if it.get("field") == "assignee" and it.get("to") == account_id:
+                if latest is None or created > latest["_created_dt"]:
+                    author = h.get("author", {})
+                    latest = {
+                        "_created_dt": created,
+                        "created": h.get("created"),
+                        "by_account": author.get("accountId"),
+                        "by_name": author.get("displayName"),
+                        "from_name": it.get("fromString"),
+                    }
+    return latest
+
+
+def assignments_since(account_id, after_iso):
+    """Every task assigned to account_id after after_iso and still assigned to
+    them now, most-recent first, each enriched with who assigned it. Returns a
+    list of dicts (key/summary/status/created/by_account/by_name/from_name); []
+    if none.
+
+    JQL gives a coarse day-level shortlist of 'currently theirs, reassigned to
+    them recently'; the exact post-No check is done per issue against the
+    changelog."""
+    if not (configured() and account_id):
+        return []
+    # Coarse JQL bound, a day BEFORE the No: JQL's date-only AFTER skips same-day
+    # changes, which would miss assignments made the same day as the No. The exact
+    # post-No cutoff is enforced per issue against the changelog, so the margin is
+    # safe (it just hands a few extra candidates to _assignee_change_after).
+    after_dt = _dt(after_iso)
+    day = ((after_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+           if after_dt else (after_iso or "")[:10])
+    acc = account_id.replace('"', '')
+    jql = (f'assignee = "{acc}" AND assignee CHANGED TO "{acc}" '
+           f'AFTER "{day}" ORDER BY updated DESC')
+    try:
+        data = _post("/rest/api/3/search/jql",
+                     {"jql": jql, "fields": ["key", "summary", "status"], "maxResults": 50})
+    except Exception:
+        logger.exception("assignment search failed for %s", account_id)
+        return []
+    out = []
+    for issue in data.get("issues", []):
+        change = _assignee_change_after(issue["key"], account_id, after_iso)
+        if not change:
+            continue
+        f = issue.get("fields", {})
+        out.append({
+            "key": issue["key"],
+            "summary": f.get("summary", ""),
+            "status": (f.get("status") or {}).get("name", ""),
+            **change,
+        })
+    out.sort(key=lambda c: c["_created_dt"], reverse=True)  # newest first
+    for c in out:
+        c.pop("_created_dt", None)  # internal sort key
+    return out

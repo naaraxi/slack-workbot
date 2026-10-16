@@ -132,6 +132,12 @@ DEFAULTS = {
     "report_prefix": "{mention} ✋ ",
     # Header for the threaded task-suggestion reply.
     "suggest_header": "Suggested tasks:",
+    # Posted in the report thread when the user later gets assigned a task.
+    "assigned_notice": ":white_check_mark: <@{user}> was assigned <{url}|{key}> — {summary} (now *{status}*)",
+    "assigned_by": " · by {by}",
+    # When several tasks were assigned since the No, a header plus one line each.
+    "assigned_header": ":white_check_mark: <@{user}> was assigned {n} tasks:",
+    "assigned_line": "• <{url}|{key}> — {summary} (*{status}*)",
     # Posted once, when the bot newly joins the report channel.
     "join_message": (
         ":wave: Hi, I'm *WorkBot*. I check in privately with people about whether "
@@ -335,6 +341,31 @@ def join_message(lang=None):
 
 def suggest_header(lang=None):
     return t("suggest_header", lang)
+
+
+def assigned_text(user_id, items, lang=None):
+    """The 'user got assigned task(s)' announcement for the report thread. `items`
+    is a list of dicts (key/url/summary/status/by), newest first; `by` is a
+    ready-to-render actor (a Slack mention or a plain name), omitted if unknown.
+    One task -> a single line; several -> a header plus one line each."""
+    if len(items) == 1:
+        it = items[0]
+        text = t("assigned_notice", lang).format(
+            user=user_id, url=it["url"], key=it["key"],
+            summary=it["summary"], status=it["status"] or "assigned",
+        )
+        if it.get("by"):
+            text += t("assigned_by", lang).format(by=it["by"])
+        return text
+    lines = [t("assigned_header", lang).format(user=user_id, n=len(items))]
+    for it in items:
+        line = t("assigned_line", lang).format(
+            url=it["url"], key=it["key"], summary=it["summary"], status=it["status"] or "assigned",
+        )
+        if it.get("by"):
+            line += t("assigned_by", lang).format(by=it["by"])
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def needs_task_text(user_ids, lang=None, mention=""):

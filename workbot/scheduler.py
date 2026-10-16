@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from . import db, jira, messages, suggest
+from . import assign, db, jira, messages, suggest
 
 logger = logging.getLogger("workbot")
 
@@ -496,6 +496,10 @@ def start(client, report_channel, report_mention=""):
     if suggest.enabled():
         # Refresh the Codex usage/rate-limit snapshot hourly (a tiny separate query).
         sched.add_job(suggest.refresh_usage, "interval", seconds=3600, id="codex_usage")
+    if assign.enabled():
+        # Watch for assignments on open "No" threads and announce them in-thread.
+        sched.add_job(lambda: assign.spawn_watch(client), "interval",
+                      seconds=assign.POLL_SECONDS, id="assign_watch")
     sched.start()
     logger.info(
         "Scheduler started (check-in 60s, ignore threshold %s, prune DMs after %sh, channel=%s)",
