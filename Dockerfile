@@ -1,6 +1,6 @@
 # Pinned to a digest so rebuilds are reproducible (see project_docker_image_pinning).
 # To bump: docker pull python:3.12-slim && docker images --digests python
-FROM python:3.12-slim@sha256:05cda9777409a9c3ffddd94a4c476b79f0769a0b4857f0c7ed9226b6800b0d6f
+FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
 
 WORKDIR /app
 
@@ -15,6 +15,9 @@ RUN apt-get update \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs bubblewrap \
     && npm install -g @openai/codex@0.162.1 \
+    # NodeSource's npm bundles its own dependencies (pacote, sigstore...), and
+    # Trivy flags old copies of them; npm 11 carries current ones
+    && npm install -g npm@11 \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 COPY workbot ./workbot
