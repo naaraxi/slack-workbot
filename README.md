@@ -135,6 +135,7 @@ full list and descriptions. The main ones:
 | `WORKBOT_PRUNE_AFTER_HOURS` | Delete the bot's own DMs older than this (0 to disable) |
 | `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_TOKEN` | Jira Cloud site and API token |
 | `WORKBOT_SUGGEST_ENABLED` | Suggest Jira tasks on a No (default off) |
+| `WORKBOT_SUGGEST_REPEAT_DAYS` | Skip tasks offered to the same user in the last N days (default 3) |
 | `WORKBOT_CANDIDATE_STATUSES` / `_EXCLUDE_STATUSES` | Which statuses are eligible |
 | `WORKBOT_ASSIGN_WATCH_ENABLED` | Announce in-thread when a user is assigned a task |
 

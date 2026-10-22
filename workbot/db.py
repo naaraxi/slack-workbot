@@ -384,6 +384,17 @@ def get_report_thread(channel, thread_ts):
         return dict(row) if row else None
 
 
+def recent_suggested(user_id, since_iso):
+    """Every key offered to this user in report threads created since `since_iso`,
+    across all threads, so a new No can steer away from repeats."""
+    with _conn() as conn:
+        rows = conn.execute(
+            "SELECT suggested FROM report_threads WHERE user_id = ? AND created_at >= ?",
+            (user_id, since_iso),
+        ).fetchall()
+    return {k for r in rows for k in (r["suggested"] or "").split(",") if k}
+
+
 def add_thread_suggested(channel, thread_ts, keys):
     """Append newly offered keys to the thread's accumulated 'already suggested'
     set, so later follow-ups don't repeat them."""

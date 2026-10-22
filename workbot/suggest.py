@@ -21,6 +21,7 @@ import re
 import subprocess
 import tempfile
 import threading
+from datetime import datetime, timedelta, timezone
 
 from . import db, jira, messages
 
@@ -38,6 +39,12 @@ CODEX_TIMEOUT = int(os.environ.get("WORKBOT_SUGGEST_TIMEOUT", "90"))
 # discourages long chats, and the bot never replies to itself (bot_id filtered).
 FOLLOWUP_CONTEXT_MSGS = int(os.environ.get("WORKBOT_SUGGEST_CONTEXT_MSGS", "12"))
 FOLLOWUP_CONTEXT_CHARS = int(os.environ.get("WORKBOT_SUGGEST_CONTEXT_CHARS", "2000"))
+# Variety across Nos: tasks already offered to a user in the last N days are left
+# out of their next pick (0 turns this off). Without it the same input gives the
+# same top 3 every time. Priorities listed in REPEAT_KEEP stay eligible anyway, so
+# an urgent ticket keeps surfacing until someone takes it.
+REPEAT_DAYS = int(os.environ.get("WORKBOT_SUGGEST_REPEAT_DAYS", "3"))
+REPEAT_KEEP = {p.strip() for p in os.environ.get("WORKBOT_SUGGEST_REPEAT_KEEP", "Highest,High").split(",") if p.strip()}
 
 # Codex writes session rollouts (which carry the rate-limit snapshot behind
 # `/status`) under here; we read the newest one to surface account usage.
@@ -60,11 +67,25 @@ def refresh_candidates():
         logger.info("Cached %d Jira candidate tasks", len(cands))
 
 
-def _candidates_for(user):
+def _recently_offered(user_id):
+    """Keys offered to this user within REPEAT_DAYS (any thread), or an empty set."""
+    if REPEAT_DAYS <= 0:
+        return set()
+    since = (datetime.now(timezone.utc) - timedelta(days=REPEAT_DAYS)).isoformat()
+    return db.recent_suggested(user_id, since)
+
+
+def _candidates_for(user, avoid=()):
     """The org-wide cached pool, capped. The user's selected projects are a soft
     preference (handled in the prompt), not a filter - but we move their project
-    tasks to the front so they always survive the input cap."""
+    tasks to the front so they always survive the input cap. Keys in `avoid`
+    (recent offers) are dropped unless their priority is in REPEAT_KEEP."""
     cands = json.loads(db.meta_get("jira_candidates") or "[]")
+    if avoid:
+        fresh = [c for c in cands if c["key"] not in avoid or c.get("priority") in REPEAT_KEEP]
+        # Only skip repeats when enough fresh tasks are left to fill a pick.
+        if len(fresh) >= 3:
+            cands = fresh
     projects = {k for k in (user.get("jira_projects") or "").split(",") if k.strip()}
     if projects:
         preferred = [c for c in cands if c.get("project") in projects]
@@ -322,7 +343,7 @@ def _reply(client, user_id, channel, thread_ts):
     user = db.get_user(user_id)
     if not user:
         return
-    candidates = _candidates_for(user)
+    candidates = _candidates_for(user, _recently_offered(user_id))
     if not candidates:
         return  # nothing in scope to suggest
     picks = _pick(user, candidates)
@@ -386,7 +407,7 @@ def _followup(client, event):
     user = db.get_user(row["user_id"])
     if not user:
         return
-    candidates = _candidates_for(user)
+    candidates = _candidates_for(user, _recently_offered(row["user_id"]))
     if not candidates:
         return
     try:
