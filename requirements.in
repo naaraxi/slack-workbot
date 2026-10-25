@@ -1,0 +1,10 @@
+# Direct dependencies. requirements.txt is the locked, hashed list built from
+# this file; the image installs only that (pip --require-hashes).
+#
+# To update every package to its newest release (run in this folder):
+#   docker run --rm -v "$PWD":/w -w /w python:3.12-slim sh -c \
+#     'pip install -q pip-tools && pip-compile --generate-hashes --strip-extras -o requirements.txt requirements.in'
+# then rebuild: docker compose build && docker compose up -d
+slack_bolt>=1.21
+APScheduler>=3.10
+tzdata>=2024.1

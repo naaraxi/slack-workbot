@@ -1,6 +1,10 @@
 services:
   workbot:
-    build: .
+    build:
+      context: .
+      args:
+        # Set by docker-auto-update.sh; reruns the apt upgrade layer
+        SECURITY_REFRESH: ${SECURITY_REFRESH:-manual}
     container_name: workbot
     restart: unless-stopped
     env_file: .env

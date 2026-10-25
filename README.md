@@ -96,6 +96,18 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+### Dependencies
+
+- Python packages are installed only from `requirements.txt`, which pins exact
+  versions with hashes (`pip --require-hashes`). The direct dependencies are
+  listed in `requirements.in`; the command to update the lock is at the top of
+  that file.
+- Node (for the Codex CLI) comes from the official `node:22` image in a build
+  stage. Only `node` and Codex are copied into the final image. The Codex version
+  is pinned in the `Dockerfile`.
+- The base image is `python:3.12-slim`. Rebuild with `docker compose build --pull`
+  to take Debian and Python fixes.
+
 State (per-user settings, report threads, token counters) is kept in a SQLite
 database under `data/`, which is a mounted volume. All user-facing text is
 generated into `data/strings/` as one JSON file per language on first run; edit
