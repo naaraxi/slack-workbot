@@ -55,12 +55,21 @@ def _status_clause():
     return f"{base} AND status NOT IN ({_jql_name_list(exclude)})" if exclude else base
 
 
+def excluded_projects():
+    """Project keys from WORKBOT_EXCLUDE_PROJECTS, never suggested or offered."""
+    return _csv_env("WORKBOT_EXCLUDE_PROJECTS")
+
+
 def candidate_jql():
     """Unassigned, actionable, non-trivial work across all projects (filtered per
     user by project later). Priority-ordered so a truncated fetch keeps the top.
     Low/Lowest stay in but sort to the bottom, surfacing only as a last resort."""
+    # Excluded projects are dropped in the query itself, so they never use up
+    # the cache cap.
+    excluded = excluded_projects()
+    project_clause = f"AND project NOT IN ({_jql_name_list(excluded)}) " if excluded else ""
     return (
-        f"assignee IS EMPTY AND {_status_clause()} "
+        f"assignee IS EMPTY AND {_status_clause()} {project_clause}"
         "AND issuetype NOT IN (Epic, Sub-task) "
         "ORDER BY priority DESC, created ASC"
     )
@@ -160,6 +169,8 @@ def fetch_projects():
         return []
     projects = []
     start = 0
+    # Excluded projects are hidden from the Settings dropdown too.
+    excluded = set(excluded_projects())
     try:
         # project/search is paginated; walk until isLast.
         while True:
@@ -170,6 +181,8 @@ def fetch_projects():
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.load(resp)
             for p in data.get("values", []):
+                if p["key"] in excluded:
+                    continue
                 projects.append({"key": p["key"], "name": p["name"]})
             if data.get("isLast", True) or not data.get("values"):
                 break

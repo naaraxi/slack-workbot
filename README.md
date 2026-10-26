@@ -121,7 +121,8 @@ seconds, no restart needed.
 2. Set `WORKBOT_SUGGEST_ENABLED=1` to suggest tasks on a **No**. Tune which
    statuses count as candidates with `WORKBOT_CANDIDATE_STATUSES` (allowlist) or
    `WORKBOT_CANDIDATE_EXCLUDE_STATUSES` (denylist); the default is any "To Do"
-   status category.
+   status category. List project keys in `WORKBOT_EXCLUDE_PROJECTS` to keep
+   them out of both the suggestions and the Settings project picker.
 3. Set `WORKBOT_ASSIGN_WATCH_ENABLED=1` for the assignment watch. It needs the
    `users:read.email` scope and the per-user Jira account IDs, cached once with:
 
@@ -149,6 +150,7 @@ full list and descriptions. The main ones:
 | `WORKBOT_SUGGEST_ENABLED` | Suggest Jira tasks on a No (default off) |
 | `WORKBOT_SUGGEST_REPEAT_DAYS` | Skip tasks offered to the same user in the last N days (default 3) |
 | `WORKBOT_CANDIDATE_STATUSES` / `_EXCLUDE_STATUSES` | Which statuses are eligible |
+| `WORKBOT_EXCLUDE_PROJECTS` | Jira project keys never suggested or offered in Settings |
 | `WORKBOT_ASSIGN_WATCH_ENABLED` | Announce in-thread when a user is assigned a task |
 
 ## License
