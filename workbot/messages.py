@@ -70,10 +70,10 @@ DEFAULTS = {
     # Check-in DM + answers
     "checkin": "Do you have a Jira task you're working on right now?",
     "checkin_fallback": "WorkBot check-in: do you have a task?",
-    "btn_yes": "Yes",
     "btn_no": "No",
-    "btn_almost": "Almost Done",
-    "answer_yes": (
+    "btn_snooze": "Snooze",
+    "snooze_next": "Until next check-in (~{interval})",
+    "answer_snooze_next": (
         "Great - carry on. I'll check in again in about {interval}. Feel free to "
         "ignore it if you're busy, or tap *I'm free now* the moment you're between "
         "tasks and I'll check in right away."
@@ -81,19 +81,13 @@ DEFAULTS = {
     "answer_no": "Thanks. I'll let the channel know you're free for a task.",
     "answer_no_failed": "Thanks. I couldn't reach the channel just now - please let them know directly.",
     "checkin_stale": "This check-in is no longer active.",
-    "answer_almost": "Got it - I'll leave you alone for about {label}. Tap *I'm free now* if you finish sooner.",
+    "answer_snooze": "Got it - I'll leave you alone for about {label}. Tap *I'm free now* if you finish sooner.",
     "free_ack_off_hours": "Noted - you're outside your working hours, so I'll check in when they next start.",
     "expired": "(This check-in expired - I'll ask again.)",
     "paused": (
         "I'll stop checking in for the rest of today. Tap *I'm free now* below, "
         "or run `/workbot`, whenever you want me to resume."
     ),
-    # Almost Done modal
-    "almost_title": "Almost done?",
-    "almost_submit": "Save",
-    "almost_cancel": "Cancel",
-    "almost_intro": "Roughly how much longer on this task? I'll hold off until then.",
-    "almost_field_label": "Estimated time remaining",
     # Home tab + manual trigger / contextual buttons
     "btn_checkin_now": "Check me in now",
     "btn_free_now": "I'm free now",
@@ -109,7 +103,7 @@ DEFAULTS = {
     "home_offhours": "Outside your working hours. Next check-in {time}.",
     "home_next": "Next check-in {time} ({rel}).",
     "home_active_users": "Total users: {n}",
-    "home_stats": "Your check-ins so far: {yes} Yes, {no} No, {almost} Almost Done, {ignored} ignored",
+    "home_stats": "Your check-ins so far: {no} No, {snoozed} Snoozed, {ignored} ignored",
     "home_codex_tokens": "Codex tokens this cycle: {tokens}",
     "home_codex_usage": "Codex usage: {percent} of the {window} limit, resets {reset}",
     "home_codex_usage_secondary": " (plus {percent} of the {window} limit)",
@@ -166,8 +160,10 @@ DAY_CHOICES = [
     ("Sunday", "7"),
 ]
 
-# Duration choices for the Almost Done modal: (label, minutes). Edit here.
-ALMOST_CHOICES = [
+# Duration choices for the Snooze menu: (label, minutes). Edit here. Only the
+# ones longer than the user's check-in interval are offered, since a shorter
+# snooze would end before the next check-in is due anyway.
+SNOOZE_CHOICES = [
     ("15 minutes", "15"),
     ("30 minutes", "30"),
     ("45 minutes", "45"),
@@ -276,8 +272,8 @@ def checkin_stale(lang=None):
     return t("checkin_stale", lang)
 
 
-def answer_almost(label, lang=None):
-    return t("answer_almost", lang).format(label=label)
+def answer_snooze(label, lang=None):
+    return t("answer_snooze", lang).format(label=label)
 
 
 def disabled_confirm(lang=None):
@@ -308,9 +304,9 @@ def checkin_fallback(lang=None):
     return t("checkin_fallback", lang)
 
 
-def answer_yes(user):
+def answer_snooze_next(user):
     lang = user.get("lang")
-    return t("answer_yes", lang).format(interval=interval_label(user.get("interval_minutes") or 60))
+    return t("answer_snooze_next", lang).format(interval=interval_label(user.get("interval_minutes") or 60))
 
 
 def _jira_suffix(user, lang):
@@ -386,8 +382,8 @@ def _hours_label(user):
     return "not set"
 
 
-def almost_label(minutes):
-    for label, value in ALMOST_CHOICES:
+def snooze_label(minutes):
+    for label, value in SNOOZE_CHOICES:
         if value == str(minutes):
             return label
     return f"{minutes} minutes"
@@ -492,7 +488,13 @@ def _stats_block(st, lang):
     s = st.get("stats")
     if not s or sum(s.values()) == 0:
         return None
-    text = t("home_stats", lang).format(yes=s["yes"], no=s["no"], almost=s["almost"], ignored=s["ignored"])
+    # Snoozed folds in the old Yes and Almost Done answers. The raw counts are
+    # passed too, so an older strings file using {yes} / {almost} still renders.
+    snoozed = s.get("snooze", 0) + s.get("yes", 0) + s.get("almost", 0)
+    text = t("home_stats", lang).format(
+        no=s.get("no", 0), snoozed=snoozed, ignored=s.get("ignored", 0),
+        yes=s.get("yes", 0), almost=s.get("almost", 0),
+    )
     return {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
 
 
@@ -745,7 +747,21 @@ def settings_modal(user, private_metadata="", lang=None, jira_projects=None):
     }
 
 
-def checkin_blocks(lang=None):
+def checkin_blocks(user):
+    """The check-in question with a No button and a Snooze menu. Picking a
+    Snooze option answers right away (no modal). The first option waits one
+    normal interval; the rest are the longer fixed durations."""
+    lang = user.get("lang")
+    interval = user.get("interval_minutes") or 60
+    options = [{
+        "text": {"type": "plain_text", "text": t("snooze_next", lang).format(interval=interval_label(interval))},
+        "value": "next",
+    }]
+    options += [
+        {"text": {"type": "plain_text", "text": label}, "value": value}
+        for label, value in SNOOZE_CHOICES
+        if int(value) > interval
+    ]
     return [
         {"type": "section", "text": {"type": "mrkdwn", "text": t("checkin", lang)}},
         {
@@ -753,49 +769,15 @@ def checkin_blocks(lang=None):
             "elements": [
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": t("btn_yes", lang)},
-                    "style": "primary",
-                    "action_id": "wb_yes",
-                },
-                {
-                    "type": "button",
                     "text": {"type": "plain_text", "text": t("btn_no", lang)},
                     "action_id": "wb_no",
                 },
                 {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": t("btn_almost", lang)},
-                    "action_id": "wb_almost",
+                    "type": "static_select",
+                    "placeholder": {"type": "plain_text", "text": t("btn_snooze", lang)},
+                    "action_id": "wb_snooze",
+                    "options": options,
                 },
             ],
         },
     ]
-
-
-def almost_done_modal(private_metadata="", lang=None):
-    options = [
-        {"text": {"type": "plain_text", "text": label}, "value": value}
-        for label, value in ALMOST_CHOICES
-    ]
-    return {
-        "type": "modal",
-        "callback_id": "wb_almost_modal",
-        "private_metadata": private_metadata,
-        "title": {"type": "plain_text", "text": t("almost_title", lang)},
-        "submit": {"type": "plain_text", "text": t("almost_submit", lang)},
-        "close": {"type": "plain_text", "text": t("almost_cancel", lang)},
-        "blocks": [
-            {"type": "section", "text": {"type": "mrkdwn", "text": t("almost_intro", lang)}},
-            {
-                "type": "input",
-                "block_id": "dur_block",
-                "label": {"type": "plain_text", "text": t("almost_field_label", lang)},
-                "element": {
-                    "type": "static_select",
-                    "action_id": "dur",
-                    "options": options,
-                    "initial_option": options[3],  # 1 hour
-                },
-            },
-        ],
-    }

@@ -1,15 +1,15 @@
 """The proactive side of WorkBot.
 
 One background job:
-  - check-in tick (every 60s): DM each eligible user the Yes/No/Almost Done
-    question when their interval is due, during their working hours.
+  - check-in tick (every 60s): DM each eligible user the check-in
+    question (No / Snooze) when their interval is due, during their working hours.
 
 Reports post immediately: when a user answers No, one "needs a task" message is
 sent to the configured channel right away (no batching).
 
 Silent by default: the tick only ever iterates db.enabled_users(), i.e. users
 who ran /workbot, enabled it, and set working hours. It also skips users who
-are out of office (status emoji), snoozed (Almost Done), outside working
+are out of office (status emoji), snoozed, outside working
 hours, or paused after ignoring several check-ins in a row.
 """
 
@@ -330,7 +330,7 @@ def send_checkin(client, user):
     channel = client.conversations_open(users=user["user_id"])["channel"]["id"]
     resp = client.chat_postMessage(
         channel=channel,
-        blocks=messages.checkin_blocks(lang),
+        blocks=messages.checkin_blocks(user),
         text=messages.checkin_fallback(lang),
     )
     db.record_sent(user["user_id"], channel, resp["ts"])

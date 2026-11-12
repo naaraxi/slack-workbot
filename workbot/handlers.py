@@ -1,10 +1,11 @@
 """Slack interaction handlers: /workbot, enable/disable, working-hours modal,
-the Yes/No/Almost Done check-in answers, and the "free" DM.
+the No / Snooze check-in answers, and the "free" DM.
 """
 
 import json
 import logging
 import os
+import re
 import urllib.request
 from datetime import datetime, timedelta
 
@@ -91,17 +92,6 @@ def _publish_home(client, user_id):
         client.views_publish(user_id=user_id, view=messages.home_view(user, st))
     except Exception:
         logger.exception("views_publish failed for %s", user_id)
-
-
-def _stale_checkin(user, msg_ts):
-    """True if a clicked check-in is not the user's current, answerable one -
-    they've since disabled the bot, already answered, or it's an old message.
-    Used to reject stale buttons before opening a modal."""
-    if not user or not user.get("enabled"):
-        return True
-    if not user.get("awaiting_reply"):
-        return True
-    return msg_ts != user.get("last_msg_ts")
 
 
 def _trigger_checkin_now(client, user_id):
@@ -265,22 +255,6 @@ def register(app):
 
     # --- check-in answers -------------------------------------------------
 
-    @app.action("wb_yes")
-    def on_yes(ack, body, client):
-        ack()
-        user_id = body["user"]["id"]
-        # Atomic claim: rejects a disabled user, an already-answered or an old
-        # check-in, and de-dupes concurrent/repeat clicks.
-        if not db.claim_checkin(user_id, body.get("message", {}).get("ts")):
-            user = db.get_user(user_id)
-            _update_message(client, body, messages.checkin_stale(user.get("lang") if user else None))
-            return
-        user = db.get_user(user_id) or {}
-        db.record_answer(user_id, "yes")
-        db.record_event(user_id, "yes")  # log for stats / export
-        text = messages.answer_yes(user)
-        _update_message(client, body, text, messages.confirm_free_blocks(text, user.get("lang")))
-
     @app.action("wb_no")
     def on_no(ack, body, client):
         ack()
@@ -300,52 +274,37 @@ def register(app):
         if isinstance(result, tuple):
             suggest.spawn(client, user_id, result[0], result[1])
 
-    @app.action("wb_almost")
-    def on_almost(ack, body, client):
+    @app.action("wb_snooze")
+    def on_snooze(ack, body, client):
         ack()
         user_id = body["user"]["id"]
-        # Read-only stale check before opening the modal; the real claim happens
-        # on submit so cancelling the modal leaves the check-in still open.
-        user = db.get_user(user_id)
-        if _stale_checkin(user, body.get("message", {}).get("ts")):
+        # Atomic claim, same as No: rejects stale or already-answered check-ins.
+        if not db.claim_checkin(user_id, body.get("message", {}).get("ts")):
+            user = db.get_user(user_id)
             _update_message(client, body, messages.checkin_stale(user.get("lang") if user else None))
             return
-        pm = json.dumps(
-            {"channel": body["channel"]["id"], "ts": body["message"]["ts"]}
-        )
-        client.views_open(
-            trigger_id=body["trigger_id"],
-            view=messages.almost_done_modal(private_metadata=pm),
-        )
-
-    @app.view("wb_almost_modal")
-    def on_almost_submit(ack, body, view, client):
-        ack()
-        user_id = body["user"]["id"]
-        pm = json.loads(view.get("private_metadata") or "{}")
-        # Claim now: the check-in may have been superseded while the modal was open.
-        if not db.claim_checkin(user_id, pm.get("ts")):
-            return
         user = db.get_user(user_id) or {}
-        minutes = int(
-            view["state"]["values"]["dur_block"]["dur"]["selected_option"]["value"]
-        )
-        db.record_answer(user_id, "almost")
-        db.record_event(user_id, "almost", detail=str(minutes))  # log + keep the minutes
-        db.set_snooze(user_id, (_now_utc() + timedelta(minutes=minutes)).isoformat())
+        choice = body["actions"][0]["selected_option"]["value"]
+        db.record_answer(user_id, "snooze")
+        if choice == "next":
+            # Plain "busy": no snooze needed, the normal interval does the waiting.
+            db.record_event(user_id, "snooze")
+            text = messages.answer_snooze_next(user)
+        else:
+            # Longer snooze: hold check-ins until then; keep the minutes in the log.
+            minutes = int(choice)
+            db.record_event(user_id, "snooze", detail=str(minutes))
+            db.set_snooze(user_id, (_now_utc() + timedelta(minutes=minutes)).isoformat())
+            text = messages.answer_snooze(messages.snooze_label(minutes), user.get("lang"))
+        _update_message(client, body, text, messages.confirm_free_blocks(text, user.get("lang")))
 
-        text = messages.answer_almost(messages.almost_label(minutes), user.get("lang"))
-        # pm (channel + ts of the check-in message) was parsed above; reuse it.
-        if pm.get("channel") and pm.get("ts"):
-            try:
-                client.chat_update(
-                    channel=pm["channel"],
-                    ts=pm["ts"],
-                    text=text,
-                    blocks=messages.confirm_free_blocks(text, user.get("lang")),
-                )
-            except Exception:
-                logger.exception("chat_update failed on almost-done")
+    @app.action(re.compile(r"^wb_(yes|almost)$"))
+    def on_legacy_answer(ack, body, client):
+        # Buttons from check-ins sent before Yes / Almost Done were replaced by
+        # Snooze. Mark them stale; the next check-in supersedes them anyway.
+        ack()
+        user = db.get_user(body["user"]["id"])
+        _update_message(client, body, messages.checkin_stale(user.get("lang") if user else None))
 
     # --- App Home tab -----------------------------------------------------
 

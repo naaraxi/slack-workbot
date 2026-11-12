@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS users (
     last_msg_ts         TEXT,                         -- ts of the open check-in
     consecutive_ignored INTEGER NOT NULL DEFAULT 0,
     paused_until        TEXT,                         -- ISO-8601 UTC, nullable
-    last_answer         TEXT,                         -- 'yes' / 'no' / 'almost'
+    last_answer         TEXT,                         -- 'snooze' / 'no' (older rows: 'yes' / 'almost')
     last_reset_day      TEXT,                         -- local 'YYYY-MM-DD' of last daily reset
     lang                TEXT,                         -- language code, e.g. 'en' / 'sv'
     last_free           TEXT,                         -- ISO-8601 UTC of last accepted 'free' DM
@@ -90,8 +90,8 @@ EVENTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL,
-    event   TEXT NOT NULL,   -- 'yes' / 'no' / 'almost' / 'ignored'
-    detail  TEXT,            -- e.g. the Almost Done minutes; else NULL
+    event   TEXT NOT NULL,   -- 'snooze' / 'no' / 'ignored' (older: 'yes' / 'almost')
+    detail  TEXT,            -- snooze minutes for a timed snooze; else NULL
     ts      TEXT NOT NULL    -- ISO-8601 UTC
 );
 CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id);
@@ -249,7 +249,7 @@ def set_last_free(user_id, when_iso):
     _update(user_id, last_free=when_iso)
 
 
-# --- snooze (Almost Done) -------------------------------------------------
+# --- snooze (timed Snooze option) -----------------------------------------
 
 
 def set_snooze(user_id, until_iso):
@@ -492,7 +492,7 @@ def record_event(user_id, event, detail=None):
 
 def event_counts(user_id):
     """All-time per-outcome counts for one user, zero-filled."""
-    counts = {"yes": 0, "no": 0, "almost": 0, "ignored": 0}
+    counts = {"snooze": 0, "no": 0, "ignored": 0, "yes": 0, "almost": 0}
     with _conn() as conn:
         rows = conn.execute(
             "SELECT event, COUNT(*) AS c FROM events WHERE user_id = ? GROUP BY event",

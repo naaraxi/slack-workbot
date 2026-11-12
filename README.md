@@ -16,11 +16,11 @@ it needs no public URL.
   interval (30m / 1h / 2h / 3h / 4h) and language. Settings also hold their role,
   preferred Jira projects, and which weekdays to check in on.
 - During their working hours WorkBot sends a direct message asking if they have
-  a task, with three buttons:
-  - **Yes** - carry on; it checks again one interval later.
-  - **Almost Done** - pick how much longer you need; it stays quiet until then.
+  a task. There are two ways to answer:
   - **No** - WorkBot posts to the configured channel that you are free for a
     task.
+  - **Snooze** - a menu. "Until next check-in" asks again one interval later;
+    the longer durations keep it quiet until then.
 - A **No** posts to the channel immediately, one message per person, and can
   optionally mention a user group (for example your project managers) and
   pre-seed acknowledgement reactions.
