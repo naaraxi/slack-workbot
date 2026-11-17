@@ -22,8 +22,7 @@ it needs no public URL.
   - **Snooze** - a menu. "Until next check-in" asks again one interval later;
     the longer durations keep it quiet until then.
 - A **No** posts to the channel immediately, one message per person, and can
-  optionally mention a user group (for example your project managers) and
-  pre-seed acknowledgement reactions.
+  optionally mention a user group (for example your project managers).
 - An App Home tab shows your status, the next check-in time, and buttons to
   enable/disable, open settings, pause for the day, or check in now.
 
@@ -73,8 +72,7 @@ Create an app at <https://api.slack.com/apps> (from scratch is fine) and:
 2. **OAuth & Permissions - Bot Token Scopes**:
    - Core: `commands`, `chat:write`, `chat:write.public`, `im:write`,
      `im:history`, `im:read`, `users:read`, `channels:read`, `channels:join`
-     (resolve and join the report channel), `reactions:write` and
-     `reactions:read` (acknowledgement reactions).
+     (resolve and join the report channel).
    - For task suggestions and in-thread follow-ups: `channels:history` (read
      replies in the report thread).
    - Optional: `usergroups:read` to mention a user group on reports;
