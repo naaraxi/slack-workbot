@@ -40,9 +40,9 @@ works exactly as above.
   (`@WorkBot ...`) to get a fresh set or a quick answer; it replies
   conversationally and only re-suggests when asked. Image and text-less messages
   are ignored.
-- **Assignment watch.** Once a reported user actually gets assigned a task,
-  WorkBot replies in that same thread ("@user was assigned KEY ... by @assigner")
-  and closes it out. Only the user's most recent report is tracked.
+- **Assignment watch.** Every time a reported user gets assigned a task that day,
+  WorkBot replies in that same thread ("@user was assigned KEY ... by @assigner").
+  Each assignment is posted once. Only the user's most recent report is tracked.
 - **Home-tab metrics.** When suggestions are on, the Home tab also shows WorkBot's
   Codex token use for the current cycle and the account's rate-limit usage.
 

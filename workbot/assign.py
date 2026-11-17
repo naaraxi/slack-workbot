@@ -1,10 +1,11 @@
 """Assignment watch - closes the loop on a "No".
 
 When a user answered No, the bot reported it and suggested tasks in a thread.
-This polls Jira for each such user's most recent open thread and, once they get
-assigned a task (after that No), replies in that thread: "@user was assigned
-KEY - summary (Status), by @assigner". Then the thread is resolved and dropped
-from the watch.
+This polls Jira for each such user's most recent open thread and, every time they
+get assigned a task (after that No), replies in that thread: "@user was assigned
+KEY - summary (Status), by @assigner". The thread stays watched for the rest of
+the day, so a second or third assignment is posted too. Each assignment is posted
+once (tracked in report_threads.announced).
 
 Only the user's latest open thread is watched - a newer No supersedes older ones
 (handled in db.record_report_thread), so the announcement always lands on the
@@ -53,6 +54,13 @@ def _item(match):
     }
 
 
+def _token(match):
+    """One assignment's identity: the ticket plus when it was assigned. Using the
+    time, not just the key, means a ticket taken away and handed back again is
+    announced again."""
+    return f"{match['key']}@{match.get('created') or ''}"
+
+
 def _announce(client, row, matches):
     items = [_item(m) for m in matches]
     text = messages.assigned_text(row["user_id"], items)
@@ -62,7 +70,8 @@ def _announce(client, row, matches):
     except Exception:
         logger.exception("Could not post assignment notice for %s", row["user_id"])
         return
-    db.resolve_report_thread(row["channel"], row["thread_ts"])
+    # Mark these as posted, but keep the thread open for later assignments.
+    db.add_announced(row["channel"], row["thread_ts"], [_token(m) for m in matches])
     logger.info("Announced %d assignment(s) for %s: %s",
                 len(items), row["user_id"], ", ".join(i["key"] for i in items))
 
@@ -87,6 +96,9 @@ def _watch(client):
         except Exception:
             logger.exception("Assignment check failed for %s", row["user_id"])
             continue
+        # Drop assignments this thread already announced on an earlier pass.
+        done = set(filter(None, (row.get("announced") or "").split(",")))
+        matches = [m for m in matches if _token(m) not in done]
         if matches:
             _announce(client, row, matches)
 

@@ -101,8 +101,12 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 # One row per report thread we posted suggestions in, so a later reply in that
 # thread can be matched to the user it is about and answered with a re-suggest.
 # `suggested` accumulates the keys already offered (so we don't repeat them).
-# `resolved` closes a thread out of the assignment watch: set when we announce an
-# assignment, or when a newer No for the same user supersedes this one.
+# `resolved` closes a thread out of the assignment watch: set when a newer No for
+# the same user supersedes this one, or when the day is over. Announcing an
+# assignment does NOT close it, so every later assignment that day is posted too.
+# `announced` holds the assignments already posted in the thread as "KEY@<changelog
+# time>" tokens, so each one is posted once, and a ticket taken away and handed
+# back again still counts as a new assignment.
 REPORT_THREADS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS report_threads (
     channel    TEXT NOT NULL,
@@ -110,6 +114,7 @@ CREATE TABLE IF NOT EXISTS report_threads (
     user_id    TEXT NOT NULL,
     suggested  TEXT NOT NULL DEFAULT '',
     resolved   INTEGER NOT NULL DEFAULT 0,
+    announced  TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     PRIMARY KEY (channel, thread_ts)
 );
@@ -131,6 +136,9 @@ def init_db():
         rt_cols = {row["name"] for row in conn.execute("PRAGMA table_info(report_threads)")}
         if "resolved" not in rt_cols:
             conn.execute("ALTER TABLE report_threads ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0")
+        # Add report_threads.announced to tables created before repeat announcements.
+        if "announced" not in rt_cols:
+            conn.execute("ALTER TABLE report_threads ADD COLUMN announced TEXT NOT NULL DEFAULT ''")
 
 
 def meta_get(key):
@@ -356,11 +364,22 @@ def resolve_old_threads(before_iso):
         )
 
 
-def resolve_report_thread(channel, thread_ts):
+def add_announced(channel, thread_ts, tokens):
+    """Remember assignments already posted in this thread ("KEY@time" tokens), so
+    the next watch pass skips them. The thread itself stays open."""
     with _conn() as conn:
-        conn.execute(
-            "UPDATE report_threads SET resolved = 1 WHERE channel = ? AND thread_ts = ?",
+        row = conn.execute(
+            "SELECT announced FROM report_threads WHERE channel = ? AND thread_ts = ?",
             (channel, thread_ts),
+        ).fetchone()
+        if not row:
+            return
+        # Append to the existing CSV, keeping order and dropping duplicates.
+        merged = [t for t in row["announced"].split(",") if t]
+        merged += [t for t in tokens if t and t not in merged]
+        conn.execute(
+            "UPDATE report_threads SET announced = ? WHERE channel = ? AND thread_ts = ?",
+            (",".join(merged), channel, thread_ts),
         )
 
 
