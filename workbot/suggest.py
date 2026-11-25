@@ -34,8 +34,9 @@ ENABLED = os.environ.get("WORKBOT_SUGGEST_ENABLED", "0") not in ("0", "", "false
 CACHE_MAX = int(os.environ.get("WORKBOT_SUGGEST_CACHE_MAX", "2000"))    # org-wide fetch cap (cached hourly, so generous)
 CODEX_INPUT_MAX = int(os.environ.get("WORKBOT_SUGGEST_INPUT_MAX", "200"))  # passed to Codex
 CODEX_TIMEOUT = int(os.environ.get("WORKBOT_SUGGEST_TIMEOUT", "90"))
-# How many tasks one suggestion (first pick or follow-up) offers.
-PICK_COUNT = max(1, int(os.environ.get("WORKBOT_SUGGEST_COUNT", "5")))
+# How many tasks one suggestion (first pick or follow-up) offers. Always this
+# many when the pool has them: role fits first, then a top-up (see _top_up).
+PICK_COUNT = max(1, int(os.environ.get("WORKBOT_SUGGEST_COUNT", "10")))
 # How much of the thread we feed back to Codex on a follow-up (last N messages,
 # trimmed to a char budget) - keeps each conversational reply bounded in tokens.
 # Replies themselves are uncapped: the terse "idk, have a task" style naturally
@@ -278,6 +279,23 @@ def _sample(shortlist):
     return [c for c in shortlist if c in chosen]
 
 
+def _top_up(picks, pool):
+    """Fill `picks` up to PICK_COUNT from `pool`, in pool order. The pool lists
+    the user's own projects first, each part priority-ordered, so a short role
+    shortlist is padded with their projects' tasks before anything unrelated.
+    Padding is done here, not by the model: asked for a fixed count, the model
+    padded with off-role tasks from other projects."""
+    out = list(picks)
+    have = {c["key"] for c in out}
+    for c in pool:
+        if len(out) >= PICK_COUNT:
+            break
+        if c["key"] not in have:
+            out.append(c)
+            have.add(c["key"])
+    return out
+
+
 def _codex_followup(candidates, role, projects, convo, exclude):
     """Follow-up: the member replied in the thread after an earlier suggestion.
     This uses a conversational prompt (distinct from the one-shot initial pick):
@@ -342,7 +360,7 @@ def _pick(user, candidates):
         # dict.fromkeys drops any key the model repeated, keeping order.
         shortlist = [by_key[k] for k in dict.fromkeys(keys) if k in by_key]
         if shortlist:
-            return _sample(shortlist)
+            return _top_up(_sample(shortlist), candidates)
     # Fallback: candidates are already priority-ordered.
     return candidates[:PICK_COUNT]
 
@@ -464,8 +482,12 @@ def _followup(client, event):
     reply, keys = _codex_followup(pool, role, projects, convo, already)
     if not reply and not keys:
         return  # Codex failed / nothing to say - stay silent
-    by_key = {c["key"]: c for c in candidates}
-    picks = [by_key[k] for k in keys if k in by_key][:PICK_COUNT]
+    # Only keys from the pool, so nothing this thread already offered comes back.
+    by_key = {c["key"]: c for c in pool}
+    picks = [by_key[k] for k in dict.fromkeys(keys) if k in by_key][:PICK_COUNT]
+    if picks:
+        # They asked for tasks: always offer a full set, padded from the pool.
+        picks = _top_up(picks, pool)
     text = reply or messages.suggest_header()
     if picks:
         text = f"{text}\n{_pick_lines(picks)}".strip()
