@@ -6,9 +6,9 @@ unassigned tasks that fit the user's role.
 Flow:
   - An hourly job caches the org-wide unassigned pool (jira.fetch_candidates),
     so handling a No needs no live Jira call.
-  - On a No, we filter that cache to the user's projects, let Codex rank the 3
-    best by role, and post them as a threaded reply (priority emoji + labeled
-    link, no preview).
+  - On a No, we filter that cache to the user's projects, let Codex rank the best
+    few by role (PICK_COUNT), and post them as a threaded reply (priority emoji,
+    linked key and title, no preview).
 
 Everything degrades gracefully: any failure (Jira, Codex, Slack) just means no
 suggestion reply - the notification itself still stands.
@@ -33,6 +33,8 @@ ENABLED = os.environ.get("WORKBOT_SUGGEST_ENABLED", "0") not in ("0", "", "false
 CACHE_MAX = int(os.environ.get("WORKBOT_SUGGEST_CACHE_MAX", "2000"))    # org-wide fetch cap (cached hourly, so generous)
 CODEX_INPUT_MAX = int(os.environ.get("WORKBOT_SUGGEST_INPUT_MAX", "200"))  # passed to Codex
 CODEX_TIMEOUT = int(os.environ.get("WORKBOT_SUGGEST_TIMEOUT", "90"))
+# How many tasks one suggestion (first pick or follow-up) offers.
+PICK_COUNT = max(1, int(os.environ.get("WORKBOT_SUGGEST_COUNT", "5")))
 # How much of the thread we feed back to Codex on a follow-up (last N messages,
 # trimmed to a char budget) - keeps each conversational reply bounded in tokens.
 # Replies themselves are uncapped: the terse "idk, have a task" style naturally
@@ -41,7 +43,7 @@ FOLLOWUP_CONTEXT_MSGS = int(os.environ.get("WORKBOT_SUGGEST_CONTEXT_MSGS", "12")
 FOLLOWUP_CONTEXT_CHARS = int(os.environ.get("WORKBOT_SUGGEST_CONTEXT_CHARS", "2000"))
 # Variety across Nos: tasks already offered to a user in the last N days are left
 # out of their next pick (0 turns this off). Without it the same input gives the
-# same top 3 every time. Priorities listed in REPEAT_KEEP stay eligible anyway, so
+# same top picks every time. Priorities listed in REPEAT_KEEP stay eligible anyway, so
 # an urgent ticket keeps surfacing until someone takes it.
 REPEAT_DAYS = int(os.environ.get("WORKBOT_SUGGEST_REPEAT_DAYS", "3"))
 REPEAT_KEEP = {p.strip() for p in os.environ.get("WORKBOT_SUGGEST_REPEAT_KEEP", "Highest,High").split(",") if p.strip()}
@@ -84,7 +86,7 @@ def _candidates_for(user, avoid=()):
     if avoid:
         fresh = [c for c in cands if c["key"] not in avoid or c.get("priority") in REPEAT_KEEP]
         # Only skip repeats when enough fresh tasks are left to fill a pick.
-        if len(fresh) >= 3:
+        if len(fresh) >= PICK_COUNT:
             cands = fresh
     projects = {k for k in (user.get("jira_projects") or "").split(",") if k.strip()}
     if projects:
@@ -246,24 +248,26 @@ def usage_summary():
 
 
 def _codex_pick(candidates, role, projects):
-    """Initial suggestion: the 3 best-fit issue keys for the role; [] on failure.
+    """Initial suggestion: the PICK_COUNT best-fit issue keys for the role; [] on failure.
     Projects are a soft preference, not a hard filter."""
     prompt = (
         f"A {role} team member needs a task.{_pref_clause(projects)} The <stdin> block lists "
-        "candidate Jira issues, one per line as 'KEY [priority, project] summary'. Choose the 3 "
+        f"candidate Jira issues, one per line as 'KEY [priority, project] summary'. Choose the {PICK_COUNT} "
         f"that best fit a {role}, balancing fit and priority. Pick Low or Lowest priority tasks "
-        "only as a last resort, when nothing of higher priority fits the role. Output ONLY the 3 "
+        f"only as a last resort, when nothing of higher priority fits the role. Output ONLY the {PICK_COUNT} "
         "issue keys, comma-separated, nothing else. Use only the list; do not use any tools."
     )
-    return re.findall(r"[A-Z][A-Z0-9]+-\d+", _codex_run(prompt, _listing(candidates)))[:3]
+    return re.findall(r"[A-Z][A-Z0-9]+-\d+", _codex_run(prompt, _listing(candidates)))[:PICK_COUNT]
 
 
 def _codex_followup(candidates, role, projects, convo, exclude):
     """Follow-up: the member replied in the thread after an earlier suggestion.
     This uses a conversational prompt (distinct from the one-shot initial pick):
     the model reads the thread and decides whether tasks are even warranted.
-    Returns (reply_text, keys) - a short natural message plus up to 3 new task
+    Returns (reply_text, keys) - a short natural message plus up to PICK_COUNT new task
     keys, or ('', []) on failure so the caller can stay silent."""
+    # JSON shape shown to the model, with one placeholder per wanted key.
+    keys_example = ",".join(f'"KEY{i}"' for i in range(1, PICK_COUNT + 1))
     exclude_part = (
         f" You have already suggested {', '.join(exclude)}; never offer those again."
         if exclude else ""
@@ -276,7 +280,7 @@ def _codex_followup(candidates, role, projects, convo, exclude):
         "one per line as 'KEY [priority, project] summary'. Here is the thread so far, oldest "
         f"first:\n\"\"\"\n{convo}\n\"\"\"\n"
         "Respond to their LAST message:\n"
-        f"- If they want different or more tasks, choose 3 fresh ones that fit a {role or 'team'} "
+        f"- If they want different or more tasks, choose {PICK_COUNT} fresh ones that fit a {role or 'team'} "
         "member (balance fit and priority; Low/Lowest only as a last resort) and add a cheerful "
         "one-line intro.\n"
         "- If they accept or pick a task, cheer them on and suggest NO tasks.\n"
@@ -284,7 +288,7 @@ def _codex_followup(candidates, role, projects, convo, exclude):
         "good-natured quip that plays along for a beat, then breezily steer back to tasks, and "
         "suggest NO tasks unless they asked for them.\n"
         "Reply with ONE line of JSON and nothing else: "
-        '{"reply": "<your message to them, max 30 words>", "keys": ["KEY1","KEY2","KEY3"]}. '
+        '{"reply": "<your message to them, max 30 words>", "keys": [' + keys_example + ']}. '
         'Use "keys": [] when you are not suggesting tasks. Use only keys from the list. Do not '
         "use any tools."
     )
@@ -300,32 +304,48 @@ def _codex_followup(candidates, role, projects, convo, exclude):
     except Exception:
         logger.exception("Could not parse follow-up JSON: %r", answer[:200])
     reply = (data.get("reply") or "").strip()
-    keys = [k for k in (data.get("keys") or []) if isinstance(k, str)][:3]
+    keys = [k for k in (data.get("keys") or []) if isinstance(k, str)][:PICK_COUNT]
     # Last-ditch: JSON unusable but the model named some keys in prose - use them.
     if not reply and not keys:
-        keys = re.findall(r"[A-Z][A-Z0-9]+-\d+", answer)[:3]
+        keys = re.findall(r"[A-Z][A-Z0-9]+-\d+", answer)[:PICK_COUNT]
     return reply, keys
 
 
 def _pick(user, candidates):
-    """Initial pick: up to 3 (key, priority) - Codex by role (+ project
-    preference) when possible, else top-3 by priority."""
+    """Initial pick: up to PICK_COUNT candidate dicts - Codex by role (+ project
+    preference) when possible, else the top ones by priority."""
     by_key = {c["key"]: c for c in candidates}
     role = (user.get("role") or "").replace(",", "/")  # multi-role -> "Backend/DevOps"
     projects = sorted({k for k in (user.get("jira_projects") or "").split(",") if k.strip()})
-    if ENABLED and role and len(candidates) > 3:
+    if ENABLED and role and len(candidates) > PICK_COUNT:
         keys = _codex_pick(candidates, role, projects)
-        picks = [(k, by_key[k]["priority"]) for k in keys if k in by_key][:3]
+        picks = [by_key[k] for k in keys if k in by_key][:PICK_COUNT]
         if picks:
             return picks
     # Fallback: candidates are already priority-ordered.
-    return [(c["key"], c["priority"]) for c in candidates[:3]]
+    return candidates[:PICK_COUNT]
+
+
+def _escape(text):
+    """Escape Slack's control characters. Jira titles are free text, and an
+    unescaped '<!channel>' or '<@U...>' in one would ping people."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _pick_lines(picks):
-    """Render picks as emoji + labeled Jira links, one per line."""
+    """Render picks one per line as: emoji [KEY] - Task title. Only the [KEY]
+    part is the Jira link, so nothing in a title can break the link markup."""
     base = jira.BASE_URL
-    return "\n".join(f"{PRIORITY_EMOJI.get(p, '⚪')} <{base}/browse/{k}|{k}>" for k, p in picks)
+    lines = []
+    for c in picks:
+        emoji = PRIORITY_EMOJI.get(c.get("priority"), "⚪")
+        line = f"{emoji} <{base}/browse/{c['key']}|[{c['key']}]>"
+        # Titles are one line in Jira, but collapse any stray whitespace anyway.
+        title = " ".join((c.get("summary") or "").split())
+        if title:
+            line += f" - {_escape(title)}"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 def _post(client, channel, thread_ts, text):
@@ -355,7 +375,7 @@ def _reply(client, user_id, channel, thread_ts):
         logger.exception("Could not post suggestions for %s", user_id)
         return
     # Remember the thread so the user can reply in it for a re-suggest.
-    db.record_report_thread(channel, thread_ts, user_id, ",".join(k for k, _ in picks))
+    db.record_report_thread(channel, thread_ts, user_id, ",".join(c["key"] for c in picks))
 
 
 def spawn(client, user_id, channel, thread_ts):
@@ -424,7 +444,7 @@ def _followup(client, event):
     if not reply and not keys:
         return  # Codex failed / nothing to say - stay silent
     by_key = {c["key"]: c for c in candidates}
-    picks = [(k, by_key[k]["priority"]) for k in keys if k in by_key][:3]
+    picks = [by_key[k] for k in keys if k in by_key][:PICK_COUNT]
     text = reply or messages.suggest_header()
     if picks:
         text = f"{text}\n{_pick_lines(picks)}".strip()
@@ -434,7 +454,7 @@ def _followup(client, event):
         logger.exception("Could not post follow-up for %s", row["user_id"])
         return
     if picks:
-        db.add_thread_suggested(channel, thread_ts, [k for k, _ in picks])
+        db.add_thread_suggested(channel, thread_ts, [c["key"] for c in picks])
 
 
 def spawn_followup(client, event):
