@@ -147,7 +147,7 @@ full list and descriptions. The main ones:
 | `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_TOKEN` | Jira Cloud site and API token |
 | `WORKBOT_SUGGEST_ENABLED` | Suggest Jira tasks on a No (default off) |
 | `WORKBOT_SUGGEST_COUNT` | How many tasks each suggestion offers (default 5) |
-| `WORKBOT_SUGGEST_REPEAT_DAYS` | Skip tasks offered to the same user in the last N days (default 3) |
+| `WORKBOT_SUGGEST_ALWAYS` | Priorities always offered when they fit, the rest are a random draw (default Highest,High) |
 | `WORKBOT_CANDIDATE_STATUSES` / `_EXCLUDE_STATUSES` | Which statuses are eligible |
 | `WORKBOT_EXCLUDE_PROJECTS` | Jira project keys never suggested or offered in Settings |
 | `WORKBOT_ASSIGN_WATCH_ENABLED` | Announce in-thread when a user is assigned a task |

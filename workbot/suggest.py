@@ -6,9 +6,10 @@ unassigned tasks that fit the user's role.
 Flow:
   - An hourly job caches the org-wide unassigned pool (jira.fetch_candidates),
     so handling a No needs no live Jira call.
-  - On a No, we filter that cache to the user's projects, let Codex rank the best
-    few by role (PICK_COUNT), and post them as a threaded reply (priority emoji,
-    linked key and title, no preview).
+  - On a No, we put the user's projects first in that cache, let Codex shortlist
+    the tasks that fit their role (SHORTLIST), offer a random PICK_COUNT of them,
+    and post them as a threaded reply (priority emoji, linked key and title, no
+    preview).
 
 Everything degrades gracefully: any failure (Jira, Codex, Slack) just means no
 suggestion reply - the notification itself still stands.
@@ -17,11 +18,11 @@ suggestion reply - the notification itself still stands.
 import json
 import logging
 import os
+import random
 import re
 import subprocess
 import tempfile
 import threading
-from datetime import datetime, timedelta, timezone
 
 from . import db, jira, messages
 
@@ -41,12 +42,14 @@ PICK_COUNT = max(1, int(os.environ.get("WORKBOT_SUGGEST_COUNT", "5")))
 # discourages long chats, and the bot never replies to itself (bot_id filtered).
 FOLLOWUP_CONTEXT_MSGS = int(os.environ.get("WORKBOT_SUGGEST_CONTEXT_MSGS", "12"))
 FOLLOWUP_CONTEXT_CHARS = int(os.environ.get("WORKBOT_SUGGEST_CONTEXT_CHARS", "2000"))
-# Variety across Nos: tasks already offered to a user in the last N days are left
-# out of their next pick (0 turns this off). Without it the same input gives the
-# same top picks every time. Priorities listed in REPEAT_KEEP stay eligible anyway, so
-# an urgent ticket keeps surfacing until someone takes it.
-REPEAT_DAYS = int(os.environ.get("WORKBOT_SUGGEST_REPEAT_DAYS", "3"))
-REPEAT_KEEP = {p.strip() for p in os.environ.get("WORKBOT_SUGGEST_REPEAT_KEEP", "Highest,High").split(",") if p.strip()}
+# Variety across Nos: Codex shortlists up to SHORTLIST best-fit tasks and we
+# offer a random PICK_COUNT of them, so repeats are allowed but new tasks rotate
+# in. This replaced a "skip recent offers" filter: for a frequent No-sayer it
+# drained their projects' pool and pushed picks into unrelated projects (a
+# Hetzner Infra ticket offered to a Backend user). Priorities in ALWAYS_PRIORITIES
+# are always offered when shortlisted, so an urgent ticket keeps surfacing.
+SHORTLIST = PICK_COUNT * 2
+ALWAYS_PRIORITIES = {p.strip() for p in os.environ.get("WORKBOT_SUGGEST_ALWAYS", "Highest,High").split(",") if p.strip()}
 
 # Codex writes session rollouts (which carry the rate-limit snapshot behind
 # `/status`) under here; we read the newest one to surface account usage.
@@ -69,25 +72,11 @@ def refresh_candidates():
         logger.info("Cached %d Jira candidate tasks", len(cands))
 
 
-def _recently_offered(user_id):
-    """Keys offered to this user within REPEAT_DAYS (any thread), or an empty set."""
-    if REPEAT_DAYS <= 0:
-        return set()
-    since = (datetime.now(timezone.utc) - timedelta(days=REPEAT_DAYS)).isoformat()
-    return db.recent_suggested(user_id, since)
-
-
-def _candidates_for(user, avoid=()):
+def _candidates_for(user):
     """The org-wide cached pool, capped. The user's selected projects are a soft
     preference (handled in the prompt), not a filter - but we move their project
-    tasks to the front so they always survive the input cap. Keys in `avoid`
-    (recent offers) are dropped unless their priority is in REPEAT_KEEP."""
+    tasks to the front so they always survive the input cap."""
     cands = json.loads(db.meta_get("jira_candidates") or "[]")
-    if avoid:
-        fresh = [c for c in cands if c["key"] not in avoid or c.get("priority") in REPEAT_KEEP]
-        # Only skip repeats when enough fresh tasks are left to fill a pick.
-        if len(fresh) >= PICK_COUNT:
-            cands = fresh
     projects = {k for k in (user.get("jira_projects") or "").split(",") if k.strip()}
     if projects:
         preferred = [c for c in cands if c.get("project") in projects]
@@ -96,11 +85,28 @@ def _candidates_for(user, avoid=()):
     return cands[:CODEX_INPUT_MAX]
 
 
+def _project_names():
+    """Project key -> name from the cache the Settings dropdown uses, or {}."""
+    try:
+        return {p["key"]: p["name"] for p in json.loads(db.meta_get("jira_projects") or "[]")}
+    except Exception:
+        logger.exception("Could not read cached Jira project names")
+        return {}
+
+
 def _listing(candidates):
-    """The candidate pool as one line per issue, for the model's <stdin>."""
-    return "\n".join(
-        f"{c['key']} [{c['priority']}, {c['project']}] {c['summary']}" for c in candidates
-    )
+    """The candidate pool as one line per issue, for the model's <stdin>, as
+    'KEY [priority, project name] summary'. The name matters: a bare key like HI
+    hides that it is 'Hetzner Infra', and the model then gave an infra timeout
+    ticket to a Backend user."""
+    names = _project_names()
+    lines = []
+    for c in candidates:
+        project = c["project"]
+        if names.get(project):
+            project = f"{project} {names[project]}"
+        lines.append(f"{c['key']} [{c['priority']}, {project}] {c['summary']}")
+    return "\n".join(lines)
 
 
 def _pref_clause(projects):
@@ -248,16 +254,28 @@ def usage_summary():
 
 
 def _codex_pick(candidates, role, projects):
-    """Initial suggestion: the PICK_COUNT best-fit issue keys for the role; [] on failure.
-    Projects are a soft preference, not a hard filter."""
+    """Initial suggestion: a shortlist of up to SHORTLIST best-fit issue keys for
+    the role, best first; [] on failure. Projects are a soft preference, not a
+    hard filter. The prompt forbids padding: when it demanded an exact count, the
+    model filled the last slots with tasks from unrelated projects."""
     prompt = (
         f"A {role} team member needs a task.{_pref_clause(projects)} The <stdin> block lists "
-        f"candidate Jira issues, one per line as 'KEY [priority, project] summary'. Choose the {PICK_COUNT} "
-        f"that best fit a {role}, balancing fit and priority. Pick Low or Lowest priority tasks "
-        f"only as a last resort, when nothing of higher priority fits the role. Output ONLY the {PICK_COUNT} "
-        "issue keys, comma-separated, nothing else. Use only the list; do not use any tools."
+        "candidate Jira issues, one per line as 'KEY [priority, project] summary'. List up to "
+        f"{SHORTLIST} that fit a {role}, best fit first, balancing fit and priority. Pick Low or "
+        "Lowest priority tasks only as a last resort, when nothing of higher priority fits the "
+        "role. Fewer is fine: never pad the list with tasks that do not fit the role. Output ONLY "
+        "the issue keys, comma-separated, nothing else. Use only the list; do not use any tools."
     )
-    return re.findall(r"[A-Z][A-Z0-9]+-\d+", _codex_run(prompt, _listing(candidates)))[:PICK_COUNT]
+    return re.findall(r"[A-Z][A-Z0-9]+-\d+", _codex_run(prompt, _listing(candidates)))[:SHORTLIST]
+
+
+def _sample(shortlist):
+    """PICK_COUNT tasks from the shortlist: every ALWAYS_PRIORITIES task, then a
+    random draw from the rest, shown in shortlist order (best fit first)."""
+    must = [c for c in shortlist if c.get("priority") in ALWAYS_PRIORITIES][:PICK_COUNT]
+    rest = [c for c in shortlist if c not in must]
+    chosen = must + random.sample(rest, min(len(rest), PICK_COUNT - len(must)))
+    return [c for c in shortlist if c in chosen]
 
 
 def _codex_followup(candidates, role, projects, convo, exclude):
@@ -280,9 +298,10 @@ def _codex_followup(candidates, role, projects, convo, exclude):
         "one per line as 'KEY [priority, project] summary'. Here is the thread so far, oldest "
         f"first:\n\"\"\"\n{convo}\n\"\"\"\n"
         "Respond to their LAST message:\n"
-        f"- If they want different or more tasks, choose {PICK_COUNT} fresh ones that fit a {role or 'team'} "
-        "member (balance fit and priority; Low/Lowest only as a last resort) and add a cheerful "
-        "one-line intro.\n"
+        f"- If they want different or more tasks, choose up to {PICK_COUNT} fresh ones that fit a "
+        f"{role or 'team'} member (balance fit and priority; Low/Lowest only as a last resort; "
+        "fewer only when not enough fit, never pad with tasks that do not fit) and add a "
+        "cheerful one-line intro.\n"
         "- If they accept or pick a task, cheer them on and suggest NO tasks.\n"
         "- If the message is off-topic or silly, do NOT earnestly answer it: give a short, "
         "good-natured quip that plays along for a beat, then breezily steer back to tasks, and "
@@ -312,16 +331,18 @@ def _codex_followup(candidates, role, projects, convo, exclude):
 
 
 def _pick(user, candidates):
-    """Initial pick: up to PICK_COUNT candidate dicts - Codex by role (+ project
-    preference) when possible, else the top ones by priority."""
+    """Initial pick: up to PICK_COUNT candidate dicts - a random draw from Codex's
+    role shortlist (+ project preference) when possible, else the top ones by
+    priority."""
     by_key = {c["key"]: c for c in candidates}
     role = (user.get("role") or "").replace(",", "/")  # multi-role -> "Backend/DevOps"
     projects = sorted({k for k in (user.get("jira_projects") or "").split(",") if k.strip()})
     if ENABLED and role and len(candidates) > PICK_COUNT:
         keys = _codex_pick(candidates, role, projects)
-        picks = [by_key[k] for k in keys if k in by_key][:PICK_COUNT]
-        if picks:
-            return picks
+        # dict.fromkeys drops any key the model repeated, keeping order.
+        shortlist = [by_key[k] for k in dict.fromkeys(keys) if k in by_key]
+        if shortlist:
+            return _sample(shortlist)
     # Fallback: candidates are already priority-ordered.
     return candidates[:PICK_COUNT]
 
@@ -363,7 +384,7 @@ def _reply(client, user_id, channel, thread_ts):
     user = db.get_user(user_id)
     if not user:
         return
-    candidates = _candidates_for(user, _recently_offered(user_id))
+    candidates = _candidates_for(user)
     if not candidates:
         return  # nothing in scope to suggest
     picks = _pick(user, candidates)
@@ -427,7 +448,7 @@ def _followup(client, event):
     user = db.get_user(row["user_id"])
     if not user:
         return
-    candidates = _candidates_for(user, _recently_offered(row["user_id"]))
+    candidates = _candidates_for(user)
     if not candidates:
         return
     try:
